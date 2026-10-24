@@ -1,0 +1,220 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":disableRateLimiting",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    ":timezone(Europe/Zurich)",
+    "helpers:pinGitHubActionDigests",
+    "schedule:weekends"
+  ],
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": true,
+  "assignees": [
+    "lucarickli"
+  ],
+  "reviewers": [
+    "lucarickli"
+  ],
+  "packageRules": [
+    {
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "labels": [
+        "update/major"
+      ]
+    },
+    {
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "labels": [
+        "update/minor"
+      ]
+    },
+    {
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "labels": [
+        "update/patch"
+      ]
+    },
+    {
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
+      "labels": [
+        "update/digest"
+      ]
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "addLabels": [
+        "renovate/github-action"
+      ]
+    },
+    {
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "addLabels": [
+        "renovate/base-image"
+      ]
+    },
+    {
+      "matchDatasources": [
+        "github-releases",
+        "github-release-attachments"
+      ],
+      "addLabels": [
+        "renovate/github-release"
+      ]
+    },
+    {
+      "description": "Everything that automerges goes into ONE weekly PR: one build of each image per week instead of one per dependency, and no rebase-and-rebuild cascade when one of many PRs merges",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "weekly updates",
+      "groupSlug": "weekly"
+    },
+    {
+      "description": "Every action is pinned to a commit for an exact version tag, so a digest update of one means that tag was moved to a different commit, which is what a hijacked action looks like (tj-actions/changed-files, 2025). Never automerged, never mixed into the weekly PR (one non-automerge update would hold the whole group), opened at once",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "groupName": "moved GitHub action tags",
+      "groupSlug": "action-retag",
+      "automerge": false,
+      "schedule": [
+        "at any time"
+      ],
+      "addLabels": [
+        "security"
+      ]
+    },
+    {
+      "description": "Automerged updates wait 3 days after their release, so a broken or pulled release is usually gone before it is merged. Only for datasources that report release times: without one Renovate would hold the update forever",
+      "matchDatasources": [
+        "github-releases",
+        "github-release-attachments",
+        "github-tags",
+        "npm",
+        "go",
+        "golang-version"
+      ],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Claude Code (flatpak/build.sh, Containerfile) follows Anthropic's stable channel, the npm dist-tag 'stable': a release about a week old, skipping those with major regressions, instead of every daily one",
+      "matchDatasources": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "@anthropic-ai/claude-code"
+      ],
+      "followTag": "stable"
+    },
+    {
+      "description": "Majors (and replacements) are never automerged: their own PR, CI runs on it, and it waits for the owner (assigned and asked for review) to merge it",
+      "matchUpdateTypes": [
+        "major",
+        "replacement"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "The Fedora toolbox base image is not managed as a docker tag: the registry carries the next release (branched) and rawhide as plain numbers long before they are released, so a docker lookup would propose rawhide. The fedora custom manager below follows released Fedora versions instead",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchPackageNames": [
+        "registry.fedoraproject.org/fedora-toolbox"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "The move to the next Fedora release: every pin in one PR, opened as soon as endoflife.date lists the release (i.e. once it is out, not on the weekend after), never automerged",
+      "matchDatasources": [
+        "endoflife-date"
+      ],
+      "matchPackageNames": [
+        "fedora"
+      ],
+      "groupName": "Fedora",
+      "groupSlug": "fedora",
+      "automerge": false,
+      "commitMessageTopic": "Fedora",
+      "addLabels": [
+        "renovate/fedora"
+      ],
+      "schedule": [
+        "at any time"
+      ]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Fedora release the dev container is built on: the fedora-toolbox tag in the Containerfile, and the scanner container in scan.sh",
+      "managerFilePatterns": [
+        "/^Containerfile$/",
+        "/^\\.github/actions/scan-image/scan\\.sh$/"
+      ],
+      "matchStrings": [
+        "registry\\.fedoraproject\\.org/fedora-(?:toolbox|minimal):(?<currentValue>\\d+)\\b"
+      ],
+      "depNameTemplate": "fedora",
+      "datasourceTemplate": "endoflife-date",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "Versions in workflow files under a '# renovate: datasource=... depName=...' comment (cosign-release, tool versions)",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+[A-Za-z0-9_-]+: \"?(?<currentValue>[^\"\\s]+)\"?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "The development tools and VS Code extensions in tools.txt and extensions.txt: the line under each '# renovate:' comment is 'name version asset checksum members license [source]'. A checksum of sha256:<hex> (releases that publish none) is the digest the github-release-attachments datasource bumps with the version; the #sha256:<hex> of a license URL is not matched and stays as it is",
+      "managerFilePatterns": [
+        "/^tools\\.txt$/",
+        "/^extensions\\.txt$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?(?: extractVersion=(?<extractVersion>\\S+))?\\n\\S+ (?<currentValue>\\S+) \\S+ (?:sha256:(?<currentDigest>[0-9a-f]{64})|\\S+)"
+      ],
+      "extractVersionTemplate": "{{#if extractVersion}}{{{extractVersion}}}{{else}}^(?<version>.+)${{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Versions under a renovate comment in the Containerfile (ARG lines) and in flatpak/build.sh (VAR=value lines)",
+      "managerFilePatterns": [
+        "/^Containerfile$/",
+        "/^flatpak/build\\.sh$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+(?:ARG )?[A-Z0-9_]+=(?<currentValue>\\S+)(?:\\s+[A-Z0-9_]+_COMMIT=(?<currentDigest>[0-9a-f]{40})\\b)?"
+      ],
+      "extractVersionTemplate": "{{#if extractVersion}}{{{extractVersion}}}{{else}}^(?<version>.+)${{/if}}"
+    }
+  ]
+}

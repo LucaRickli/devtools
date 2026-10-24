@@ -1,0 +1,20 @@
+# Build output
+output/
+
+# Log files
+*.log
+
+# Secrets
+.env
+*.env
+*.key
+*.crt
+*.gpg
+*.asc
+*.secret
+secrets.*
+secret.*
+id_*
+# Anthropic's PUBLIC release key, which the dev builds check Claude Code's
+# signed manifest with (claude-code.sh).
+!claude-code.asc

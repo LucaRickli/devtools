@@ -1,0 +1,288 @@
+# The pull request gate. Every PR runs this one workflow, and its last job,
+# `ci-ok`, is the one status check that matters: the main branch ruleset
+# (.github/rulesets/main.json) requires it, so nothing merges (Renovate's
+# automerge included) until it is green. devcontainer.yml and flatpak.yml
+# only matter for some paths, and a required check from a path-filtered
+# workflow never reports on the PRs it skips, and blocks them forever.
+# `ci-ok` exists on every PR and reports only after everything it depends on
+# has finished: skipped (not affected by this PR) counts as passed, failed
+# or cancelled does not.
+#
+# What a PR gets: lint always; the dev container and the VS Code Flatpak,
+# built and tested, when the PR can affect them; and the pins against
+# upstream's signatures when one changes. Nothing is pushed or signed.
+#
+# On a push to main only lint runs, and only when CI plumbing, the Justfile
+# or verify-pins.sh changed (devcontainer.yml and flatpak.yml run themselves
+# on push).
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "renovate.json"
+      - "Justfile"
+      - "verify-pins.sh"
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Which of the expensive workflows this PR can affect. This workflow
+  # itself counts as everything, so a change to the wiring runs all of it.
+  changes:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      devcontainer: ${{ steps.classify.outputs.devcontainer }}
+      flatpak: ${{ steps.classify.outputs.flatpak }}
+      renovate: ${{ steps.classify.outputs.renovate }}
+      pins: ${{ steps.classify.outputs.pins }}
+    steps:
+      - name: Classify the changed files
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          CHANGED: ${{ github.event.pull_request.changed_files }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then
+            # The other workflows run on push by themselves; here only lint.
+            printf '%s\n' devcontainer=false flatpak=false renovate=true pins=false | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Both names of a rename.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' > files.txt
+          echo "changed files:"; sed 's/^/  /' files.txt
+
+          devcontainer=false flatpak=false renovate=false pins=false
+          while IFS= read -r f; do
+            case "$f" in
+              .github/workflows/ci.yml)
+                devcontainer=true; flatpak=true; renovate=true; pins=true ;;
+              # used by both builds: the runner, and the scan (its rules also
+              # drive the Flatpak's secret scan). Signing runs on push only.
+              .github/actions/prepare-runner/*|.github/actions/scan-image/*)
+                devcontainer=true; flatpak=true ;;
+              # installs just for `just flatpak` (lint always)
+              .github/actions/install-tools/*)
+                flatpak=true ;;
+              # what both builds install, test and carry
+              tools.txt|install.sh|extensions.txt|test.sh|claude-code.sh|claude-code.asc|\
+              mise-system.sh|mise-config.toml)
+                devcontainer=true; flatpak=true ;;
+              # the dev container's own files and build context
+              Containerfile|.containerignore|host-command|claude|.github/workflows/devcontainer.yml)
+                devcontainer=true ;;
+              # flatpak.yml builds with `just flatpak`.
+              flatpak/*|Justfile|.github/workflows/flatpak.yml)
+                flatpak=true ;;
+            esac
+            case "$f" in
+              renovate.json) renovate=true ;;
+            esac
+            # The pins, and how they are checked against upstream.
+            case "$f" in
+              tools.txt|extensions.txt|verify-pins.sh) pins=true ;;
+            esac
+          done < files.txt
+          # The files API stops at 3000 files. Anything that big runs
+          # everything rather than trusting a truncated list.
+          if [ "${CHANGED:-0}" -ge 3000 ]; then
+            echo "::notice::${CHANGED} changed files, more than the API lists: running everything"
+            devcontainer=true flatpak=true renovate=true pins=true
+          fi
+          {
+            echo "devcontainer=$devcontainer"
+            echo "flatpak=$flatpak"
+            echo "renovate=$renovate"
+            echo "pins=$pins"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # Cheap, and on every PR: the workflow files themselves (actionlint runs
+  # shellcheck on every `run:` block, zizmor audits them for supply-chain
+  # and permission mistakes), the shell syntax of every script (`just
+  # check`), and the Renovate config when it changed.
+  lint:
+    needs: changes
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      # renovate: datasource=docker depName=docker.io/rhysd/actionlint
+      ACTIONLINT_VERSION: "1.7.12"
+      # renovate: datasource=github-releases depName=zizmorcore/zizmor
+      ZIZMOR_VERSION: "v1.30.1"
+      # renovate: datasource=npm depName=renovate
+      RENOVATE_VERSION: "44.164.6"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD":/repo:ro --workdir /repo \
+            "docker.io/rhysd/actionlint:${ACTIONLINT_VERSION}" -color
+
+      - name: Install just and gh
+        uses: ./.github/actions/install-tools
+        with:
+          tools: just gh
+
+      # The release binary, run only once GitHub's build provenance shows it
+      # came from zizmor's release workflow at that tag. With the job's
+      # token (read-only) it also runs its online audits, such as an action
+      # pinned to a commit that is not in the action's repository, or a
+      # known-vulnerable action. The findings that are by design are in
+      # .github/zizmor.yml and inline.
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/zizmor"
+          tarball="${dir}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$dir"
+          curl -fsSL --retry 5 --retry-all-errors -o "$tarball" \
+            "https://github.com/zizmorcore/zizmor/releases/download/${ZIZMOR_VERSION}/${tarball##*/}"
+          # GitHub's attestation API fails with a 503 at times.
+          for attempt in 1 2 3; do
+            gh attestation verify "$tarball" --repo zizmorcore/zizmor \
+              --signer-workflow zizmorcore/zizmor/.github/workflows/release-binaries.yml \
+              --source-ref "refs/tags/${ZIZMOR_VERSION}" --deny-self-hosted-runners && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 10
+          done
+          tar -xzf "$tarball" -C "$dir"
+          "${dir}/zizmor" --no-progress --format=github .github/
+
+      - name: Syntax
+        run: just check
+
+      # The dev container's Claude Code pin is the Flatpak's. devcontainer.yml
+      # tests that too, but runs only when the dev container is affected.
+      - name: Claude Code pins agree
+        run: |
+          pin=$(sed -n 's/^ARG CLAUDE_VERSION=//p' Containerfile)
+          test -n "$pin" && test "$pin" = "$(sed -n 's/^CLAUDE_VERSION=//p' flatpak/build.sh)"
+
+      # Renovate needs a current Node (44.x: 24 or newer).
+      - name: Node for Renovate
+        if: needs.changes.outputs.renovate == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Renovate config
+        if: needs.changes.outputs.renovate == 'true'
+        # No file argument: with one, the validator treats it as a GLOBAL
+        # (self-hosted) config. Without, it finds renovate.json and checks it
+        # as the repository config it is.
+        run: npx --yes --package "renovate@${RENOVATE_VERSION}" -- renovate-config-validator --strict
+
+  # The pins (tools.txt, extensions.txt) against what upstream signs or
+  # attests at that version, beyond the sha256 install.sh checks
+  # (verify-pins.sh has what and why). No secrets: the token only reads
+  # public releases and attestations.
+  pins:
+    name: pins
+    needs: changes
+    if: needs.changes.outputs.pins == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # renovate: datasource=go depName=aead.dev/minisign
+      MINISIGN_VERSION: "v0.3.0"
+      # renovate: datasource=go depName=github.com/slsa-framework/slsa-verifier/v2
+      SLSA_VERIFIER_VERSION: "v2.7.1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The verifiers come pinned and checked as well. gh and Go are the base
+      # branch's pins (install.sh, sha256), which this job checked when they
+      # were merged: a pull request that bumps gh or Go is checked with the
+      # ones it replaces, not by themselves.
+      - name: Checkout the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      # cosign-installer checks the release it installs.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
+
+      # minisign and slsa-verifier built from their modules with that Go,
+      # which checks them against sum.golang.org.
+      - name: Install gh, Go, minisign and slsa-verifier
+        run: |
+          set -euo pipefail
+          prefix="${RUNNER_TEMP}/verifiers"
+          base/install.sh "$prefix" gh go
+          export GOTOOLCHAIN=local GOFLAGS=-modcacherw GOPATH="${RUNNER_TEMP}/gopath" GOBIN="${prefix}/bin"
+          "${prefix}/go/bin/go" install "aead.dev/minisign/cmd/minisign@${MINISIGN_VERSION}"
+          "${prefix}/go/bin/go" install "github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@${SLSA_VERIFIER_VERSION}"
+
+      - name: Check the pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: PATH="${RUNNER_TEMP}/verifiers/bin:${PATH}" ./verify-pins.sh
+
+  devcontainer:
+    needs: changes
+    if: needs.changes.outputs.devcontainer == 'true'
+    uses: ./.github/workflows/devcontainer.yml
+    # What devcontainer.yml's jobs ask for. On a pull request nothing is
+    # pushed or uploaded; fork PRs get a read-only token whatever is granted
+    # here.
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+  flatpak:
+    needs: changes
+    if: needs.changes.outputs.flatpak == 'true'
+    uses: ./.github/workflows/flatpak.yml
+    permissions:
+      contents: read
+      packages: write
+
+  ci-ok:
+    needs: [changes, lint, pins, devcontainer, flatpak]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Everything that ran passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' >/dev/null

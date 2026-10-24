@@ -1,0 +1,14 @@
+# The dev container's build context is the whole checkout (`podman build
+# .`), and the Containerfile copies only these files out of it. Everything
+# else stays out, so that output/ (the Flatpak build, about 1 GB), .git and
+# the rest never reach a build, and editing them reruns no step.
+*
+!tools.txt
+!extensions.txt
+!install.sh
+!claude-code.sh
+!claude-code.asc
+!mise-system.sh
+!mise-config.toml
+!host-command
+!claude
