@@ -37,7 +37,7 @@ COPY mise-system.sh mise-config.toml tools.txt /
 # that satisfies the extensions' `engines` uses them.
 FROM registry.fedoraproject.org/fedora-toolbox:44 AS vscode-extensions
 # renovate: datasource=github-releases depName=microsoft/vscode
-ARG VSCODE_VERSION=1.142.0
+ARG VSCODE_VERSION=1.143.1
 ARG DEV_HOME=/var/home/dev
 RUN --mount=type=bind,from=devtools,source=/,target=/run/devtools \
     set -eux; dnf -y install jq unzip; cd /tmp; \
@@ -130,7 +130,7 @@ RUN for c in podman docker qemu-img qemu-system-x86_64 bcvk; do \
 # signed manifest (claude-code.sh). Its updates are off for every
 # copy, also the one the VS Code extension brings.
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.285
+ARG CLAUDE_VERSION=2.1.308
 RUN --mount=type=bind,from=claude-code,source=/,target=/run/claude-code \
     pin=$(/run/claude-code/claude-code.sh "$CLAUDE_VERSION") \
     && mkdir -p /usr/local/share/claude-code \
