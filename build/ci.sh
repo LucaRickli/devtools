@@ -783,6 +783,9 @@ fetch() {
     fi
 
     rm -rf "$dir" "$dir.fetched"
+    # A fresh checkout has no output/flatpaks/ yet, and skopeo creates only
+    # the last directory of an oci: path.
+    mkdir -p "$(dirname "$dir")" || return 1
     # Where try's caller tests it, a failing command does not stop the
     # script: each step is checked.
     REGISTRY_AUTH_FILE=$work/auth.json tries "fetch $repo@$digest" \
