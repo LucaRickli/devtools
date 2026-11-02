@@ -93,7 +93,7 @@ kubectl-radar           none         a checksums.txt in the release, nothing els
 # else fails until they are added here.
 helm                    gpg          asset https://github.com/helm/helm/releases/download/{v}/helm-{v}-linux-amd64.tar.gz.asc https://raw.githubusercontent.com/helm/helm/{v}/KEYS 208DD36ED5BB3745A16743A4C7C6FBB5B91C1155,672C657BE06B4B30969C4A57461449C25E36B98E,BF888333D96A1C18E2682AAED79D67C9EC016739,7FEC81FACC7FFB2A010ADD13C2D40F4D8196E874
 helmfile                attestation  helmfile/helmfile .github/workflows/releaser.yaml
-flux                    cosign       sums {sum}.sig,{sum}.pem https://github.com/fluxcd/flux2/.github/workflows/release.yaml@refs/tags/{v}
+flux                    cosign       sums {sum}.sigstore.json https://github.com/fluxcd/flux2/.github/workflows/release.yaml@refs/tags/{v}
 talosctl                cosign       asset {asset}.bundle https://github.com/siderolabs/talos/.github/workflows/ci.yaml@refs/tags/{v}
 talosctl                release      siderolabs/talos
 talhelper               none         a checksums.txt in the release, nothing else
