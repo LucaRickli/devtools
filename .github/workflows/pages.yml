@@ -6,9 +6,11 @@
 # the VS Code Flatpak with Claude Code), each with its .flatpakrepo, and an
 # index.html. Only metadata: the images stay private, and a machine pulls
 # them with a token of its own. A Flatpak not published yet is left out
-# (index.sh), so none holds back the others.
+# (index.sh), so none holds back the others, and so is an image whose
+# cosign signature does not verify against keys/cosign.pub: the index never
+# lists an unsigned digest, whoever moved its tag.
 #
-# Started by each Flatpak's pipeline once it pushed (flatpak.yml's index
+# Started by each Flatpak's pipeline once it promoted (flatpak.yml's index
 # job), by hand (again, without a build), and when its script changes. On
 # main only, as Pages takes no other branch (the github-pages environment).
 # One at a time, the index and its deployment together, so that an older
@@ -43,7 +45,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read   # the checkout
-      packages: read   # each Flatpak's image: its manifest, its labels
+      packages: read   # each Flatpak's image: its manifest, its labels, its signature
       pages: read      # configure-pages: the site's URL
     steps:
       - name: Checkout
@@ -61,6 +63,14 @@ jobs:
       - name: Configure Pages
         id: pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      # For index.sh's check of each image's signature: the sign action's
+      # pin (cosign-installer checks the release), which Renovate bumps
+      # together.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
 
       - name: Index
         env:

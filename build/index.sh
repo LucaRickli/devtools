@@ -38,6 +38,10 @@
 #   and an org.flatpak.metadata (flatpak skips an image without it). The ID
 #   of the runtime and the SDK is the first flatpak.id label of their
 #   Containerfile.
+# - The signature of that digest: cosign verify against keys/cosign.pub, as
+#   a machine checks it (the key, no transparency log). CI moves a moving
+#   tag only to a digest it signed (build/ci.sh promote), so one that does
+#   not verify was moved by hand, or lost its signature: it is never listed.
 # Each image is where build/ci.sh push puts it: ghcr.io/<owner>/<ID, lower
 # case>, and the VS Code Flatpak at ghcr.io/<owner>/code. Its tag is
 # :latest, or :<variant> for a variant.
@@ -46,7 +50,8 @@
 # others' index:
 # - A Flatpak that cannot be read is left out, with a warning. It may not
 #   be pushed yet: a new app whose first pipeline failed.
-# - So is an image that is not its Flatpak's.
+# - So is an image that is not its Flatpak's, and one whose signature does
+#   not verify.
 # - So is an app whose runtime its root lacks: a remote never names an app
 #   whose runtime it lacks.
 # - A variant is never replaced by its plain app. While a variant's image
@@ -56,15 +61,15 @@
 # whose runtime cannot be read). The index deployed then stays.
 #
 # Where the registry answers that an image is not there, or not to be read
-# (not pushed yet, denied), it is left out at once. So a run with nothing
-# published is over in seconds. Any other failure gets three tries, 30
-# seconds apart.
+# (not pushed yet, denied), or cosign that it has no signature of the key,
+# it is left out at once. So a run with nothing published is over in
+# seconds. Any other failure gets three tries, 30 seconds apart.
 #
 # The site has only the images' metadata. The images stay private: a
 # machine pulls them with a token of its own (flatpak's OCI authenticator,
 # from oci-auth.json). The same images give the same site, byte for byte.
 #
-# Needs bash, jq and skopeo. The environment:
+# Needs bash, jq, skopeo and cosign. The environment:
 #   REGISTRY           The registry's URL. Default: https://ghcr.io. It is
 #                      the index's Registry, which flatpak pulls from:
 #                      http:// for a local one, without TLS.
@@ -83,8 +88,8 @@ set -euo pipefail
 url='' registry='' host='' owner='' repository='' remote=''
 # Where the script works: a temporary directory, removed on exit.
 work=''
-# skopeo's options (use_registry sets them).
-skopeo_opts=()
+# skopeo's and cosign's options (use_registry sets them).
+skopeo_opts=() cosign_opts=()
 # Why the registry may deny a read, for that warning (use_registry).
 denied_reason=''
 
@@ -168,15 +173,22 @@ read_environment() {
     [[ $remote =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || die "not a remote's name: $remote"
 }
 
-# use_registry: sets skopeo's options. It reads with GH_TOKEN where that is
-# set, and anonymously where not. A registry on http:// has no TLS.
+# use_registry: sets skopeo's and cosign's options. They read with GH_TOKEN
+# where that is set, and anonymously where not: the login is
+# $work/docker/config.json, which cosign reads as its DOCKER_CONFIG. A
+# registry on http:// has no TLS.
 use_registry() {
     skopeo_opts=(--retry-times 3)
-    [[ $registry == https://* ]] || skopeo_opts+=(--tls-verify=false)
+    cosign_opts=(--key keys/cosign.pub --insecure-ignore-tlog=true)
+    if [[ $registry != https://* ]]; then
+        skopeo_opts+=(--tls-verify=false)
+        cosign_opts+=(--allow-http-registry)
+    fi
+    mkdir -p "$work/docker"
     if [ -n "${GH_TOKEN:-}" ]; then
         : "${GITHUB_ACTOR:?GITHUB_ACTOR, the user of GH_TOKEN}"
-        printf '{"auths": {"%s": {"auth": "%s"}}}\n' "$host" "$(printf '%s:%s' "$GITHUB_ACTOR" "$GH_TOKEN" | base64 -w0)" >"$work/auth.json"
-        skopeo_opts+=(--authfile "$work/auth.json")
+        printf '{"auths": {"%s": {"auth": "%s"}}}\n' "$host" "$(printf '%s:%s' "$GITHUB_ACTOR" "$GH_TOKEN" | base64 -w0)" >"$work/docker/config.json"
+        skopeo_opts+=(--authfile "$work/docker/config.json")
         denied_reason="GH_TOKEN cannot read it"
     else
         denied_reason="it needs a token, GH_TOKEN"
@@ -268,6 +280,32 @@ fetch() {
     return 1
 }
 
+# signed NAME AT: succeeds if the image AT, by its digest, is signed with
+# keys/cosign.pub (cosign verify, as a machine checks it). If not, it warns
+# that NAME is left out, and returns 1: at once where cosign answers that
+# the image has no signature, or none of that key; after three tries, 30
+# seconds apart, where it fails otherwise (the registry fails at times).
+signed() {
+    local name=$1 at=$2 err=$work/stderr attempt
+    for attempt in 1 2 3; do
+        if DOCKER_CONFIG=$work/docker cosign verify "${cosign_opts[@]}" "$at" >/dev/null 2>"$err"; then
+            cat "$err" >&2
+            return 0
+        fi
+        cat "$err" >&2
+        if grep -qiE 'no signatures found|no matching signatures' "$err"; then
+            warn "$at ($name) has no signature that keys/cosign.pub verifies (cosign, above); left out"
+            return 1
+        fi
+        if [ "$attempt" != 3 ]; then
+            echo "verifying the signature of $at failed (attempt $attempt), retrying in 30s" >&2
+            sleep 30
+        fi
+    done
+    warn "could not verify the signature of $at ($name) against keys/cosign.pub (cosign, above), in three tries; left out"
+    return 1
+}
+
 # app_runtime CONFIG: prints the runtime that an app's metadata names (the
 # org.flatpak.metadata label of the image config CONFIG): the first
 # runtime= of its [Application] group, ID/ARCH/BRANCH.
@@ -288,10 +326,11 @@ index_entry() {
         "$4"
 }
 
-# read_image NAME: reads NAME's image from the registry, and checks it. Its
-# entry of the index goes to $work/NAME.json, and ref_of, digest_of and
-# runs_on get its values. An image that cannot be read, or is not NAME's,
-# gets a warning, and read_image returns 1.
+# read_image NAME: reads NAME's image from the registry, and checks it,
+# its signature last (signed). Its entry of the index goes to
+# $work/NAME.json, and ref_of, digest_of and runs_on get its values. An
+# image that cannot be read, is not NAME's or is not signed gets a warning,
+# and read_image returns 1.
 #
 # It runs as an if's condition, where a command that fails does not stop
 # the script: each step that matters is checked.
@@ -326,14 +365,16 @@ read_image() {
         [[ $runtime == ?*/?*/?* ]] || { warn "$at ($ref) names no runtime in its metadata; left out"; return 1; }
         runs_on[$name]=runtime/$runtime
     fi
+    # The digest listed is the one verified, whatever its tag says by now.
+    signed "$name" "$at" || return 1
 
     index_entry "$name" "$digest" "$media_type" "$config" >"$work/$name.json"
     ref_of[$name]=$ref
     digest_of[$name]=$digest
 }
 
-# read_images: reads each Flatpak's image. Fails where none can be read,
-# and so writes nothing.
+# read_images: reads each Flatpak's image. Fails where none can be read
+# and verified, and so writes nothing.
 read_images() {
     local name
     for name in "${names[@]}"; do
@@ -341,7 +382,7 @@ read_images() {
             readable[$name]=1
         fi
     done
-    [ "${#readable[@]}" != 0 ] || die "no Flatpak of NAMES could be read from $host/$owner: nothing written"
+    [ "${#readable[@]}" != 0 ] || die "no Flatpak of NAMES could be read from $host/$owner and verified (above): nothing written"
 }
 
 # --- the site ---
@@ -488,6 +529,7 @@ main() {
     [ ! -e "$out" ] || [ -f "$out/index/static" ] || die "$out is there, and is no site of index.sh's: not replaced"
     cd "$(dirname "$0")/.."
     read_environment
+    command -v cosign >/dev/null || die "no cosign: every image's signature is verified before it is listed"
 
     work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/index.XXXXXX")
     trap 'rm -rf "$work"' EXIT

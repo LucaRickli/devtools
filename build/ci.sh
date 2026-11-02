@@ -10,8 +10,13 @@
 #                        output/flatpaks/NAME, as `build.sh flatpak NAME`
 #                        does, on the run's cache (bake). An app is tested
 #                        on the runtime that machines get (whence).
-#   ci.sh push NAME      pushes output/flatpaks/NAME, in the job that built
-#                        and tested it.
+#   ci.sh push NAME      pushes output/flatpaks/NAME as its dated tag, in
+#                        the job that built and tested it.
+#   ci.sh promote NAME   moves NAME's moving tag (:latest, or :<variant>) to
+#                        the digest that push pushed, once its signature
+#                        verifies: the promote job, after sign. NAME
+#                        devcontainer moves the dev container's :latest and
+#                        :ai.
 #   ci.sh devcontainer   builds the dev container's two images on the run's
 #                        cache, into output/images/devcontainer and
 #                        devcontainer-ai, and into rootless podman's storage
@@ -19,9 +24,14 @@
 #
 # Each Flatpak is a pipeline of its own: build.sh names lists them (the
 # runtime, the SDK, then each app on one of them), and flatpak.yml has its
-# build, sign and index jobs. So one that fails to build or test holds back
-# none of the others. A broken app never delays the runtime's security
-# updates, or another app's release.
+# build, sign, promote and index jobs. So one that fails to build or test
+# holds back none of the others. A broken app never delays the runtime's
+# security updates, or another app's release.
+#
+# The moving tag that machines follow (:latest, :<variant>) is never pushed
+# to: build pushes the dated tag, sign signs its digest, and promote moves
+# the moving tag to that digest once the signature verifies. A sign or
+# promote that fails leaves the moving tag on the image before, signed.
 #
 # What the plan picks:
 # - On a pull request (ci.yml): the jobs that the PR can affect, by its
@@ -32,7 +42,9 @@
 # - On main, on a push and on the schedule: each Flatpak whose sources
 #   (content) changed since the last run on main that published it, pushed.
 #   That run is the newest in which its build job succeeded and, where it
-#   pushed, its sign job too. Each one whose job failed in the run before is
+#   pushed, its promote job too: signed, and its moving tag moved. Each one
+#   that a run since pushed but did not promote (its sign or promote
+#   failed) is pushed again. Each one whose job failed in the run before is
 #   tested again, so that a failure stays in sight until a run fixes it.
 # This goes per Flatpak, not per run: a run in which Remmina failed still
 # published Firefox, and the next one pushes Remmina again, not Firefox.
@@ -45,8 +57,8 @@
 # job on main wrote it. The builder and the runtime are built on the Fedora
 # image that the cache was built on, which is kept there too (fedora),
 # whatever Fedora's tag points at that day. No image goes from one job to
-# another but that way. The one artifact is what sign needs: the digests
-# pushed.
+# another but that way. The one artifact is what sign and promote need: the
+# digests pushed.
 #
 # Needs:
 # - plan: bash, git (the whole history), jq, docker with buildx (build.sh
@@ -55,13 +67,16 @@
 # - build and devcontainer: docker logged in to ghcr.io (the cache), skopeo
 #   and curl, and for an app's build on main GH_TOKEN (packages read).
 # - push: skopeo logged in to ghcr.io, and curl.
+# - promote: skopeo, cosign, curl, and GH_TOKEN (packages write), which it
+#   logs in with for its own calls alone.
 # The environment is the job's (GITHUB_*, RUNNER_TEMP), plus:
 #   EVENT        github.event_name.
 #   GH_REPO      the repository, for gh.
 #   FRESH        for the runtime's build and the dev container's (bake).
 #   DAY          for push: the plan's date, one for the whole run.
 #   BASE_RESULT, BASE_READY, BASE_PUSH, BASE_DIGEST
-#                for an app: its runtime's job and plan (whence, push).
+#                for an app: its runtime's pipeline and plan (whence, push,
+#                promote).
 #   BASE_BUILD   for an app on a pull request: whether this run builds its
 #                runtime (whence).
 set -euo pipefail
@@ -86,9 +101,10 @@ declare -A dir_of=() on_of=()
 # pushed, and why.
 declare -A will_build=() will_push=() reason=()
 # What lookup finds of each Flatpak, empty where nothing is known: the
-# commit of the newest run that published it, and the result of its newest
-# build job that ran to an end.
-declare -A published_at=() last_result=()
+# commit of the newest run that published it, the result of its newest
+# build job that ran to an end, and the commit of a newer run that pushed it
+# but did not promote it.
+declare -A published_at=() last_result=() unpromoted=()
 
 # Main's head commit, as behind found it (empty where unknown).
 tip=''
@@ -149,6 +165,16 @@ tries() {
     done
     echo "::error::could not $what" >&2
     return 1
+}
+
+# auth_file: writes $work/docker/config.json, a login to ghcr.io of
+# GITHUB_ACTOR with GH_TOKEN, which skopeo (REGISTRY_AUTH_FILE) and cosign
+# (DOCKER_CONFIG, its directory) both read: for this script's own calls
+# alone, gone on exit.
+auth_file() {
+    : "${GITHUB_ACTOR:?}" "${GH_TOKEN:?}"
+    mkdir -p "$work/docker"
+    printf '{"auths": {"ghcr.io": {"auth": "%s"}}}\n' "$(printf '%s:%s' "$GITHUB_ACTOR" "$GH_TOKEN" | base64 -w0)" >"$work/docker/config.json"
 }
 
 # --- what goes into each Flatpak ---
@@ -265,31 +291,37 @@ past_runs() {
 }
 
 # job_results NAME: prints, of one attempt's jobs (JSON on stdin), the
-# conclusion of NAME's build job, of its Push step and of its sign job:
+# conclusion of NAME's build job, of its Push step and of its promote job:
 # none for each one that is not there.
 job_results() {
-    jq -r --arg b "$1 / build" --arg s "$1 / sign" '
-        ([.jobs[] | select(.name == $s) | .conclusion][0] // "none") as $sign
+    jq -r --arg b "$1 / build" --arg p "$1 / promote" '
+        ([.jobs[] | select(.name == $p) | .conclusion][0] // "none") as $promote
         | [.jobs[] | select(.name == $b)][0]
         | if . == null then "none none none"
-          else "\(.conclusion) \([.steps[]? | select(.name == "Push") | .conclusion][0] // "none") \($sign)" end'
+          else "\(.conclusion) \([.steps[]? | select(.name == "Push") | .conclusion][0] // "none") \($promote)" end'
 }
 
 # lookup: reads, from the runs before (past_runs), what each Flatpak's
 # pipeline (flatpak.yml) did:
 # - published_at[NAME]: the head commit of the newest run that published
 #   NAME. Its build job, `NAME / build`, succeeded, and if its Push step
-#   ran, so did its sign job, `NAME / sign` (the signature).
+#   ran, so did its promote job, `NAME / promote`: the moving tag is on the
+#   digest pushed, which its sign job signed. A sign or promote that failed,
+#   or never ran (a run cancelled in between), is nothing published.
+# - unpromoted[NAME]: the head commit of a run newer than that one in which
+#   NAME's Push step succeeded: pushed, not published. The next run pushes
+#   NAME again (why_push), also where its sources did not change (the
+#   runtime's weekly push).
 # - last_result[NAME]: the conclusion of its newest build job that ran to
 #   an end: success, failure or timed_out. A skipped job (the runtime's and
 #   the SDK's, in a run that built nothing on them) or a cancelled one (a
 #   run dropped while pending) says nothing about NAME's sources. It would
 #   have the next run test NAME again for nothing.
 # An attempt's jobs are its own and those it kept from the attempt before
-# (Re-run failed jobs), every page of them (three jobs a Flatpak). The runs
+# (Re-run failed jobs), every page of them (four jobs a Flatpak). The runs
 # are read until every Flatpak has both.
 lookup() {
-    local id attempt sha json missing name job pushed sign
+    local id attempt sha json missing name job pushed promoted
     past_runs >"$work/runs"
     while read -r id attempt sha; do
         json=$(api "repos/$GH_REPO/actions/runs/$id/attempts/$attempt/jobs?per_page=100" --paginate --jq '.jobs[]' | jq -s '{jobs: .}')
@@ -298,12 +330,14 @@ lookup() {
             if [ -n "${published_at[$name]:-}" ] && [ -n "${last_result[$name]:-}" ]; then
                 continue
             fi
-            read -r job pushed sign < <(job_results "$name" <<<"$json")
+            read -r job pushed promoted < <(job_results "$name" <<<"$json")
             case $job in
             success | failure | timed_out) [ -n "${last_result[$name]:-}" ] || last_result[$name]=$job ;;
             esac
-            if [ -z "${published_at[$name]:-}" ] && [ "$job" = success ] && { [ "$pushed" = skipped ] || [ "$sign" = success ]; }; then
+            if [ -z "${published_at[$name]:-}" ] && [ "$job" = success ] && { [ "$pushed" = skipped ] || [ "$promoted" = success ]; }; then
                 published_at[$name]=$sha
+            elif [ -z "${published_at[$name]:-}" ] && [ -z "${unpromoted[$name]:-}" ] && [ "$pushed" = success ]; then
+                unpromoted[$name]=$sha
             fi
             if [ -z "${published_at[$name]:-}" ] || [ -z "${last_result[$name]:-}" ]; then
                 missing=1
@@ -359,6 +393,8 @@ why_push() {
         echo "weekly: Fedora's updates"
     elif [ -z "$published" ] || ! git cat-file -e "$published^{commit}" 2>/dev/null; then
         echo "no run that published it${published:+ in this history (${published:0:7})}"
+    elif [ -n "${unpromoted[$name]:-}" ]; then
+        echo "pushed in ${unpromoted[$name]:0:7}, but not signed and promoted: again"
     elif ! git diff --quiet "${opts[@]}" "$published" HEAD -- "${paths[@]}"; then
         echo "changed since ${published:0:7}"
     fi
@@ -480,20 +516,21 @@ moved() {
 
 # --- push ---
 
-# check_base NAME: refuses to push the app NAME, tested on this run's
-# runtime, where machines would not get that runtime: unless the runtime's
-# job succeeded in this run (BASE_RESULT), which pushed it, it fails where
+# check_base NAME WHAT: refuses to push or promote (WHAT: pushed, promoted)
+# the app NAME, tested on this run's runtime, where machines would not get
+# that runtime: unless the runtime's pipeline succeeded in this run
+# (BASE_RESULT), which pushed, signed and promoted it, it fails where
 # - the runtime is not published on the branch NAME names (BASE_READY
 #   false: a new Fedora release), as a remote never names an app whose
 #   runtime it lacks;
 # - or this run was to push the runtime (BASE_PUSH true).
 check_base() {
-    local name=$1
+    local name=$1 what=$2
     if [ "${BASE_RESULT:-}" != success ] && [ "${BASE_READY:-}" != true ]; then
-        fail "$name names a branch of its runtime that is not published, and that runtime's job ended ${BASE_RESULT:-unknown}: not pushed"
+        fail "$name names a branch of its runtime that is not published, and that runtime's pipeline ended ${BASE_RESULT:-unknown}: not $what"
     fi
     if [ "${BASE_RESULT:-}" != success ] && [ "${BASE_PUSH:-}" = true ]; then
-        fail "$name was tested on the runtime this run was to push, and that runtime's job ended ${BASE_RESULT:-unknown}: not pushed, as machines would run it on the one before"
+        fail "$name was tested on the runtime this run was to push, and that runtime's pipeline ended ${BASE_RESULT:-unknown}: not $what, as machines would run it on the one before"
     fi
 }
 
@@ -512,17 +549,16 @@ push_tag() {
 }
 
 # push NAME: pushes output/flatpaks/NAME to the repository that its
-# Flatpak's ID names, read from the layout (the ref flatpak wrote into it).
-# The VS Code Flatpak's stays where machines follow it,
-# ghcr.io/<owner>/code. A variant (<ID>-<variant>, the same ref) goes as
-# :<day>-<variant> and :<variant>, the others as :<day> and :latest.
+# Flatpak's ID names, read from the layout (the ref flatpak wrote into it),
+# as its dated tag alone: :<day>, or :<day>-<variant> for a variant
+# (<ID>-<variant>, the same ref). The VS Code Flatpak's stays where
+# machines follow it, ghcr.io/<owner>/code.
 #
-# The dated tag goes first, then the moving one: a copy that fails leaves
-# the moving tag where it was. skopeo copies the manifest byte for byte,
-# so the digest in the summary is the one a remote's index names, and both
-# tags are one digest. It goes to $RUNNER_TEMP/pushed/NAME for sign as soon
-# as it is pushed (a dated tag alone is signed too), with the output
-# pushed=true.
+# The moving tag (:latest, or :<variant>) is promote's, once sign signed
+# the digest. skopeo copies the manifest byte for byte, so the digest in
+# the summary is the one a remote's index names. It goes to
+# $RUNNER_TEMP/pushed/NAME/<moving tag>, the artifact that sign signs and
+# promote moves that tag by, with the outputs pushed=true and digest.
 #
 # Refused before anything is pushed, each failing the job so that the next
 # run pushes it again:
@@ -532,13 +568,13 @@ push_tag() {
 # - an app whose runtime machines would not get (check_base).
 push() {
     local name=$1 dir=output/flatpaks/$1 owner=${GITHUB_REPOSITORY_OWNER,,} day=${DAY:?}
-    local ref id variant='' repo tags tag digest
+    local ref id variant='' repo tag moving digest
     if behind; then
         fail "$(moved): a re-run of this run (${GITHUB_SHA:0:7}) pushes nothing, as it would put back an older $name; re-run the newest run instead"
     fi
     case $name in
     runtime | sdk) ;;
-    *) check_base "$name" ;;
+    *) check_base "$name" pushed ;;
     esac
 
     # NAME must be the layout's: a runtime, or an app of apps/ as its ID or
@@ -562,21 +598,93 @@ push() {
     repo=ghcr.io/$owner/${id,,}
     [ "$id" != io.github.lucarickli.Code ] || repo=ghcr.io/$owner/code
     "$here/private.sh" "$repo"
-    mkdir -p "$RUNNER_TEMP/pushed"
-    tags=("$day" latest)
-    [ -z "$variant" ] || tags=("$day-$variant" "$variant")
-    for tag in "${tags[@]}"; do
-        push_tag "$dir" "$repo:$tag"
-        digest=$(cat "$RUNNER_TEMP/digest")
-        # Recorded for its sign job at once, also where a later tag fails.
-        echo "$repo@$digest" >>"$RUNNER_TEMP/pushed/$name"
-        sort -u -o "$RUNNER_TEMP/pushed/$name" "$RUNNER_TEMP/pushed/$name"
-        echo "pushed=true" >>"${GITHUB_OUTPUT:-/dev/null}"
-        echo "Pushed \`$repo@$digest\` ($name) as :$tag" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+    tag=$day moving=latest
+    if [ -n "$variant" ]; then
+        tag=$day-$variant moving=$variant
+    fi
+    push_tag "$dir" "$repo:$tag"
+    digest=$(cat "$RUNNER_TEMP/digest")
+    mkdir -p "$RUNNER_TEMP/pushed/$name"
+    echo "$repo@$digest" >"$RUNNER_TEMP/pushed/$name/$moving"
+    # The digest is also what the jobs on a runtime test their apps on
+    # (whence): the one its promote moved :latest to before they started.
+    printf '%s\n' pushed=true "digest=$digest" >>"${GITHUB_OUTPUT:-/dev/null}"
+    echo "Pushed \`$repo@$digest\` ($name) as :$tag, for :$moving once it is signed" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+}
+
+# --- promote ---
+
+# signed REF: succeeds if REF, an image by its digest, is signed with
+# keys/cosign.pub, as a machine checks it: the key, no transparency log
+# (the sign action's own check). Three tries, 30 seconds apart.
+signed() {
+    DOCKER_CONFIG=$work/docker tries "verify the signature of $1 against keys/cosign.pub" \
+        cosign verify --key keys/cosign.pub --insecure-ignore-tlog=true "$1" >/dev/null
+}
+
+# move_tag REF TAG: moves the tag TAG of the repository of REF (REPO@DIGEST)
+# to REF: a copy within the registry, which keeps the digest (or fails) and
+# copies no layer, as the repository has them all. Three tries, 30 seconds
+# apart. Then the registry must name that digest for the tag.
+move_tag() {
+    local ref=$1 tag=$2 repo=${1%@*} digest=${1#*@} now
+    REGISTRY_AUTH_FILE=$work/docker/config.json tries "move $repo:$tag to $digest" \
+        skopeo copy --retry-times 3 --preserve-digests "docker://$ref" "docker://$repo:$tag"
+    now=$(REGISTRY_AUTH_FILE=$work/docker/config.json tries "read $repo:$tag" \
+        skopeo inspect --retry-times 3 --format '{{.Digest}}' "docker://$repo:$tag")
+    [ "$now" = "$digest" ] || fail "$repo:$tag is ${now:-no image}, not the $digest it was moved to"
+    echo "Promoted \`$ref\` to :$tag" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+}
+
+# promote NAME: moves each moving tag that NAME's build job pushed for to
+# the digest it pushed, as $RUNNER_TEMP/pushed/NAME has them (the artifact
+# that its sign job signed: a file for each moving tag, named after it,
+# that holds REPO@DIGEST). Every signature is verified first (signed), and
+# only then is a tag moved (move_tag). NAME is a Flatpak, or devcontainer:
+# the dev container's :latest and :ai.
+#
+# Refused before any tag is moved, each failing the job, so that the next
+# run on main pushes it again:
+# - for a Flatpak, a re-run of a run whose commit is no longer main's
+#   (behind), as push refuses one;
+# - an app whose runtime machines would not get (check_base): the runtime
+#   this run was to push, and did not promote;
+# - a file that is not a moving tag's, or that holds no digest of this
+#   repository's images (the sign action's check);
+# - a repository that is public (private.sh);
+# - a digest whose signature does not verify.
+promote() {
+    local name=$1 dir=${RUNNER_TEMP:?}/pushed/$1 owner=${GITHUB_REPOSITORY_OWNER,,}
+    local ours file tag ref i refs=() tags=() repos=()
+    if [ "$name" != devcontainer ] && behind; then
+        fail "$(moved): a re-run of this run (${GITHUB_SHA:0:7}) promotes nothing, as it would put back an older $name; re-run the newest run instead"
+    fi
+    case $name in
+    runtime | sdk | devcontainer) ;;
+    *) check_base "$name" promoted ;;
+    esac
+
+    # A moving tag's name starts with a letter, a dated one's with the date.
+    ours="^ghcr\.io/$owner/(devcontainer|code|[a-z0-9_-]+(\.[a-z0-9_-]+){2,})@sha256:[0-9a-f]{64}$"
+    for file in "$dir"/*; do
+        [ -f "$file" ] || continue
+        tag=${file##*/}
+        ref=$(cat "$file")
+        [[ $tag =~ ^[a-z][a-z0-9_.-]*$ ]] || fail "$file is no moving tag's: nothing promoted"
+        [[ $ref =~ $ours ]] || fail "$file holds ${ref:-nothing}, not a digest of this repository's images: nothing promoted"
+        tags+=("$tag") refs+=("$ref")
     done
-    # The moving tag's digest, the dated one's too: what the jobs on a
-    # runtime test their apps on (whence).
-    echo "digest=$digest" >>"${GITHUB_OUTPUT:-/dev/null}"
+    [ "${#refs[@]}" != 0 ] || fail "nothing to promote in $dir"
+    mapfile -t repos < <(printf '%s\n' "${refs[@]%@*}" | sort -u)
+    "$here/private.sh" "${repos[@]}"
+
+    auth_file
+    for ref in "${refs[@]}"; do
+        signed "$ref"
+    done
+    for i in "${!refs[@]}"; do
+        move_tag "${refs[i]}" "${tags[i]}"
+    done
 }
 
 # --- baking on the run's cache ---
@@ -712,9 +820,9 @@ label() {
 # - On main: the runtime that machines run the app on, so that an app built
 #   against a newer library than machines have fails here, not on them.
 #   That is this run's, by its digest (BASE_DIGEST), where this run pushed
-#   it (BASE_PUSH, and BASE_RESULT its job's success). Else the published
-#   one (:latest), where it is on the branch this commit names
-#   (BASE_READY).
+#   it (BASE_PUSH, and BASE_RESULT its pipeline's success: pushed, signed
+#   and promoted). Else the published one (:latest), where it is on the
+#   branch this commit names (BASE_READY).
 # - On a pull request that does not change that runtime (BASE_BUILD
 #   false): the published one too, where it can be read and is on the
 #   branch this commit names (try).
@@ -731,9 +839,9 @@ whence() {
         return
     elif [ "${BASE_PUSH:-}" = true ]; then
         if [ "${BASE_RESULT:-}" = success ] && [[ ${BASE_DIGEST:-} =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            how=fetch at=$BASE_DIGEST why="this run's, which its job pushed"
+            how=fetch at=$BASE_DIGEST why="this run's, which its pipeline pushed and promoted"
         else
-            why="its job, which was to push it, ended ${BASE_RESULT:-unknown}"
+            why="its pipeline, which was to push it, ended ${BASE_RESULT:-unknown}"
         fi
     elif [ "${BASE_READY:-}" = true ]; then
         how=fetch at=latest why="the published one, which machines have"
@@ -752,7 +860,7 @@ whence() {
 # its own calls alone.
 fetch() {
     local dir=output/flatpaks/$1 app=$2 at=$3 try=${4:-}
-    local want id ref repo src auth info digest got
+    local want id ref repo src info digest got
     : "${GITHUB_ACTOR:?}" "${GH_TOKEN:?}"
     want=$(label "output/images/$app" flatpak.runtime) || want=''
     [[ $want == ?*//?* ]] || fail "output/images/$app names no runtime (flatpak.runtime ${want:-unset})"
@@ -760,14 +868,13 @@ fetch() {
     ref=runtime/$id/$(uname -m)/${want#*//}
     repo=ghcr.io/$owner/${id,,}
     if [ "$at" = latest ]; then src=$repo:latest; else src=$repo@$at; fi
-    auth=$(printf '%s:%s' "$GITHUB_ACTOR" "$GH_TOKEN" | base64 -w0)
-    printf '{"auths": {"ghcr.io": {"auth": "%s"}}}\n' "$auth" >"$work/auth.json"
+    auth_file
 
     # A try reads once: a fork's token reads nothing, and no wait changes
     # that.
     if [ -z "$try" ]; then
-        info=$(REGISTRY_AUTH_FILE=$work/auth.json tries "read $src" skopeo inspect --retry-times 3 "docker://$src")
-    elif ! info=$(REGISTRY_AUTH_FILE=$work/auth.json skopeo inspect --retry-times 3 "docker://$src"); then
+        info=$(REGISTRY_AUTH_FILE=$work/docker/config.json tries "read $src" skopeo inspect --retry-times 3 "docker://$src")
+    elif ! info=$(REGISTRY_AUTH_FILE=$work/docker/config.json skopeo inspect --retry-times 3 "docker://$src"); then
         echo "::notice::could not read $src: $app is tested on one made here" >&2
         return 1
     fi
@@ -788,7 +895,7 @@ fetch() {
     mkdir -p "$(dirname "$dir")" || return 1
     # Where try's caller tests it, a failing command does not stop the
     # script: each step is checked.
-    REGISTRY_AUTH_FILE=$work/auth.json tries "fetch $repo@$digest" \
+    REGISTRY_AUTH_FILE=$work/docker/config.json tries "fetch $repo@$digest" \
         skopeo copy --retry-times 3 "docker://$repo@$digest" "oci:$dir.fetched:$ref" || return 1
     mv "$dir.fetched" "$dir" || return 1
     echo "Tested on \`$repo@$digest\` ($ref), $why" >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
@@ -896,9 +1003,10 @@ main() {
     plan) plan ;;
     build) build "${2:?usage: ci.sh build NAME}" ;;
     push) push "${2:?usage: ci.sh push NAME}" ;;
+    promote) promote "${2:?usage: ci.sh promote NAME}" ;;
     devcontainer) devcontainer ;;
     *)
-        echo "usage: ci.sh plan | build NAME | push NAME | devcontainer" >&2
+        echo "usage: ci.sh plan | build NAME | push NAME | promote NAME | devcontainer" >&2
         exit 2
         ;;
     esac

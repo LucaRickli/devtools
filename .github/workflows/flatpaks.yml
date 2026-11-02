@@ -1,26 +1,27 @@
 # Build the shared runtime (runtime/), the SDK on it (runtime/sdk/) and the
 # apps on them (apps/*/ with a Containerfile), and push them to
 # ghcr.io/<owner>/<flatpak ID, lowercase> as OCI images, private packages
-# all (build/private.sh refuses a public one): :latest and :<yyyymmdd>,
-# signed with the cosign key (`cosign verify --key keys/cosign.pub`;
-# flatpak itself checks only GPG). The VS Code Flatpak goes to
-# ghcr.io/<owner>/code: plain as :latest and :<yyyymmdd>, ai (with Claude
-# Code) as :ai and :<yyyymmdd>-ai, one ref, io.github.lucarickli.Code//stable,
-# which a machine takes plain or ai by the index root it adds
-# (apps/io.github.lucarickli.Code/README.md). The index, the Flatpak remote
-# on GitHub Pages, is pages.yml's.
+# all (build/private.sh refuses a public one): :<yyyymmdd>, signed with the
+# cosign key (`cosign verify --key keys/cosign.pub`; flatpak itself checks
+# only GPG), then :latest moved to it once that signature verifies. The VS
+# Code Flatpak goes to ghcr.io/<owner>/code: plain as :<yyyymmdd> and
+# :latest, ai (with Claude Code) as :<yyyymmdd>-ai and :ai, one ref,
+# io.github.lucarickli.Code//stable, which a machine takes plain or ai by
+# the index root it adds (apps/io.github.lucarickli.Code/README.md). The
+# index, the Flatpak remote on GitHub Pages, is pages.yml's.
 #
 # Each Flatpak (`build/build.sh names`, of the bake file) is a pipeline of
-# its own, flatpak.yml: build, test, scan and push, then its own sign and a
-# new index, so that one that fails or is slow holds back no other's
-# release. The plan (build/ci.sh plan) picks them: on a push to main, each
-# Flatpak whose sources changed since the last run on main that published
-# it, and each whose last pipeline failed; weekly, everything, the runtime
-# and the SDK pushed for Fedora's updates (the runtime and the builder
-# built again without the cache, FRESH); by hand, everything, as fresh.
-# The apps start right after the plan, but where this run rebuilds their
-# runtime (or the SDK): then once its pipeline is done, as they build on
-# its cache and, on main, test on the Flatpak it pushed. Every image is
+# its own, flatpak.yml: build, test, scan and push the dated tag, then its
+# own sign, promote (the moving tag) and a new index, so that one that fails
+# or is slow holds back no other's release. The plan (build/ci.sh plan)
+# picks them: on a push to main, each Flatpak whose sources changed since
+# the last run on main that published it, and each whose last pipeline
+# failed; weekly, everything, the runtime and the SDK pushed for Fedora's
+# updates (the runtime and the builder built again without the cache,
+# FRESH); by hand, everything, as fresh. The apps start right after the
+# plan, but where this run rebuilds their runtime (or the SDK): then once
+# its pipeline is done, as they build on its cache and, on main, test on the
+# Flatpak it pushed, and go out only once it is promoted. Every image is
 # baked on the registry cache, ghcr.io/<owner>/packages-cache, which every
 # job reads and only a run on main writes (build/ci.sh bake). Pull requests
 # get this through ci.yml, the PR gate, with the Flatpaks the PR can
@@ -61,9 +62,10 @@ on:
         required: false
 
 # Only pull requests supersede each other. Any other run waits for the one
-# before it (never cancelled while it pushes or signs); one that is still
-# pending when a newer one queues is dropped, and leaves its changes to
-# that one (the plan goes by the runs that published, not by the pushes).
+# before it (never cancelled while it pushes, signs or promotes); one that
+# is still pending when a newer one queues is dropped, and leaves its
+# changes to that one (the plan goes by the runs that published, not by
+# the pushes).
 concurrency:
   group: flatpaks-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -131,7 +133,7 @@ jobs:
     permissions:
       actions: write           # index: pages.yml
       contents: read
-      packages: write          # the cache, the push, the signatures
+      packages: write          # the cache, the push, the signatures, the promotion
       security-events: write   # the scan's results
     secrets:
       SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
@@ -159,7 +161,7 @@ jobs:
     permissions:
       actions: write           # index: pages.yml
       contents: read
-      packages: write          # the cache, the push, the signatures
+      packages: write          # the cache, the push, the signatures, the promotion
       security-events: write   # the scan's results
     secrets:
       SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
@@ -191,7 +193,7 @@ jobs:
     permissions:
       actions: write     # index: pages.yml
       contents: read
-      packages: write    # the cache, the runtime's Flatpak, the push, the signatures
+      packages: write    # the cache, the runtime's Flatpak, the push, the signatures, the promotion
       security-events: write   # flatpak.yml's build job asks for it (no scan here)
     secrets:
       SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
@@ -229,7 +231,7 @@ jobs:
     permissions:
       actions: write           # index: pages.yml
       contents: read
-      packages: write          # the cache, the SDK's Flatpak, the push, the signatures
+      packages: write          # the cache, the SDK's Flatpak, the push, the signatures, the promotion
       security-events: write   # the scan's results
     secrets:
       SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}

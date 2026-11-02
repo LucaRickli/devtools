@@ -64,12 +64,17 @@ test.
 ```mermaid
 flowchart LR
     subgraph buildjob ["build job"]
-        build["bake, test, scan<br/>(not the apps on the runtime)"] --> push["push, on main only<br/>dated tag, then :latest or :ai"]
+        build["bake, test, scan<br/>(not the apps on the runtime)"] --> push["push, on main only<br/>the dated tag alone"]
     end
     push --> sign["sign job<br/>release environment, cosign"]
-    sign --> index["index job<br/>starts pages.yml"]
-    index --> pages["GitHub Pages<br/>the Flatpak remote's index"]
+    sign --> promote["promote job, no key<br/>verify the signature, then<br/>:latest or :ai to that digest"]
+    promote --> index["index job<br/>starts pages.yml"]
+    index --> pages["GitHub Pages<br/>signed images only"]
 ```
+
+Promote runs only after sign succeeded, and index only after promote: a
+failed sign or promote leaves `:latest` (or `:ai`) on the image before,
+signed, and indexes nothing.
 
 - **What the plan picks**: on a pull request, what its changes can affect
   (built and tested, nothing pushed); on a push to `main`, each Flatpak
@@ -95,18 +100,22 @@ flowchart LR
   applies.
 - **The index** ([`pages.yml`](../.github/workflows/pages.yml),
   [`index.sh`](../build/index.sh)): `https://<owner>.github.io/<repository>`
-  lists every Flatpak's `:latest`, and `/ai` the same with VS Code's `:ai`.
-  Metadata only: the images stay private. A Flatpak not published yet is
-  left out, with a warning; run `pages.yml` by hand to publish the index
-  again.
-- **Pushes**: dated tag first, then `:latest` (`:<date>-ai`, then `:ai`,
-  for VS Code's ai). An app goes out only once the runtime the run was to
-  push is published. Runs on `main` queue behind each other (pull requests
-  supersede each other), and a re-run of one that `main` has moved on from
-  pushes nothing. [`private.sh`](../build/private.sh) refuses a push to a
-  public package.
+  lists every Flatpak's `:latest`, and `/ai` the same with VS Code's `:ai`,
+  each by the digest whose signature it verified against
+  [`keys/cosign.pub`](../keys/cosign.pub). Metadata only: the images stay
+  private. A Flatpak not published yet, or whose signature does not verify
+  (a tag moved by hand), is left out, with a warning; run `pages.yml` by
+  hand to publish the index again.
+- **Pushes**: the build job pushes the dated tag alone (`:<date>`, or
+  `:<date>-ai` for VS Code's ai); only promote moves `:latest` (or `:ai`),
+  to a digest whose signature verifies. An app is promoted only once the
+  runtime the run was to push is. Runs on `main` queue behind each other
+  (pull requests supersede each other), and a re-run of one that `main`
+  has moved on from pushes and promotes nothing.
+  [`private.sh`](../build/private.sh) refuses a push to a public package.
 - **Others**: [`devcontainer.yml`](../.github/workflows/devcontainer.yml)
-  builds, tests, scans, pushes and signs the dev container on change and
+  builds, tests, scans, pushes, signs and promotes the dev container (the
+  same order: dated tags, sign, then `:latest` and `:ai`) on change and
   every Monday; [`notify.yml`](../.github/workflows/notify.yml) opens an
   issue when a workflow fails on `main` and closes it on its next success.
 
@@ -115,16 +124,20 @@ alone: VS Code and Claude Code are not ours to hand out.
 
 ## Renovate
 
-[`.github/renovate.json`](../.github/renovate.json):
+[`.github/renovate.json`](../.github/renovate.json). No schedule: PRs open
+and merge at any time.
 
-- Minor, patch and digest updates go into one weekly PR
-  (`renovate/weekly`). A major and the next Fedora release get PRs of
-  their own, a Firefox release one at once.
-- Each merges itself once `ci-ok` is green, 3 days after its release where
-  the datasource tells.
+- Minor, patch and digest updates go into one PR per directory
+  (`renovate/tools`, `renovate/apps-org.remmina.remmina`,
+  `renovate/github-workflows`, …): a failing one holds back only its
+  directory's PR. Push the fix to its branch.
+- PRs of their own: each major, Firefox, Claude Code (its two pins must
+  match) and the next Fedora release (every directory at once).
+- Each waits 3 days after its release where the datasource gives a date
+  (Firefox's gives none: at once), then merges itself once `ci-ok` is
+  green.
 - Held for you: a moved tag or a digest-only update (opened at once), and
   cosign with its installer (no PR can run signing).
-- One failing update holds the whole weekly PR: push the fix to its branch.
 - Every January, Deno's first release fails `install.sh` until its
   `LICENSE.md` sha256 in `tools/tools.txt` is pinned anew.
 
@@ -133,11 +146,13 @@ alone: VS Code and Claude Code are not ours to hand out.
 Every pushed digest is signed with a private cosign key, in each
 pipeline's `sign` job. It takes `SIGNING_SECRET` from the `release`
 environment (only `main` may use it) and verifies against
-[`keys/cosign.pub`](../keys/cosign.pub). flatpak itself checks no cosign
+[`keys/cosign.pub`](../keys/cosign.pub). The `promote` job, without the
+key, verifies that signature again before it moves a moving tag, and
+`index.sh` before it lists an image. flatpak itself checks no cosign
 signature; a machine needs to be configured to verify image signatures.
 A Flatpak counts as published once its build job passed and, where it
-pushed, its sign job too: one whose signing fails is pushed again by the
-next run on `main`.
+pushed, its promote job too: one whose sign or promote fails is pushed and
+signed again by the next run on `main`.
 
 ## Adding an app
 
@@ -195,7 +210,9 @@ Its settings:
 - private vulnerability reporting on, where
   [`SECURITY.md`](../.github/SECURITY.md) sends reporters;
 - the `release` environment with the `SIGNING_SECRET` secret, deployment
-  branches limited to `main`;
+  branches limited to `main` (Deployment branches and tags, Selected
+  branches and tags, branch `main`): left at No restriction, any branch's
+  workflow may name it and take the key;
 - Pages with source GitHub Actions (Settings, Pages);
 - the Renovate GitHub App, with its workflow permission.
 

@@ -6,8 +6,7 @@
     ":dependencyDashboard",
     ":semanticCommits",
     ":timezone(Europe/Zurich)",
-    "helpers:pinGitHubActionDigests",
-    "schedule:weekends"
+    "helpers:pinGitHubActionDigests"
   ],
   "automerge": true,
   "automergeType": "pr",
@@ -78,7 +77,7 @@
       ]
     },
     {
-      "description": "The minor, patch and digest updates, but Firefox's (below), go into ONE weekly PR: one build of each image per week instead of one per dependency, and no rebase-and-rebuild cascade when one of many PRs merges. A major gets a PR of its own, the Fedora release one for all of its pins (below); every one of them merges itself once ci-ok is green, as everything here does but a moved tag",
+      "description": "The minor, patch and digest updates go into one PR per directory, that of the file they are in (tools/, devcontainer/, runtime/sdk/, apps/<ID>/, .github/workflows/, ...): what builds together updates together, and an update that fails holds back only its directory's PR. The rules below take some out: Claude Code (both of its directories in one PR), cosign, the moved tags, Firefox and the Fedora release. A major gets a PR of its own, the Fedora release one for all of its pins; every one of them merges itself once ci-ok is green, as everything here does but cosign and a moved tag",
       "matchUpdateTypes": [
         "minor",
         "patch",
@@ -86,11 +85,11 @@
         "pin",
         "pinDigest"
       ],
-      "groupName": "weekly updates",
-      "groupSlug": "weekly"
+      "groupName": "{{{packageFileDir}}}",
+      "groupSlug": "{{{replace '/' '-' packageFileDir}}}"
     },
     {
-      "description": "cosign and its installer (cosign-release, sigstore/cosign-installer: the sign action's and ci.yml's pins job's) wait for the owner, in a PR of their own: a pull request cannot run the sign job, which holds the key, so a new cosign signs for the first time on main, after the moving tags moved (its defaults have changed under this invocation before: .github/actions/sign). Out of the weekly group, which one update that does not merge itself would hold whole. Before the moved-tag rule below, which still takes a moved tag of the installer. tools.txt's cosign, a development tool, is not this",
+      "description": "cosign and its installer (cosign-release, sigstore/cosign-installer: the sign action's, the promote jobs', pages.yml's and ci.yml's pins job's) wait for the owner, in a PR of their own: a pull request cannot run the sign job, which holds the key, so a new cosign signs and verifies for the first time on main (its defaults have changed under this invocation before: .github/actions/sign). Should it fail there, nothing is promoted or indexed: the moving tags stay on the last signed images. Out of the directory groups, whose PR one update that does not merge itself would hold whole. Before the moved-tag rule below, which still takes a moved tag of the installer. tools.txt's cosign, a development tool, is not this",
       "matchManagers": [
         "github-actions"
       ],
@@ -106,7 +105,7 @@
       ]
     },
     {
-      "description": "Updates wait 3 days after their release, so a broken or pulled release is usually gone before it is merged. Only for datasources that report release times (endoflife.date gives a Fedora release's date, Docker Hub when a tag was pushed): without one Renovate would hold the update forever (minimumReleaseAgeBehaviour timestamp-required). Not Firefox's (a security release, at once)",
+      "description": "Updates wait 3 days after their release (plus Renovate's 30-minute minimumReleaseAgeBuffer), so a broken or pulled release is usually gone before it is merged. Every datasource the repository uses that reports release times, and only those (endoflife.date gives a Fedora release's date, Docker Hub when a tag was pushed; github-release-attachments is github-releases'): without one Renovate would hold the update forever (minimumReleaseAgeBehaviour timestamp-required). The two that report none are opened at once: Firefox's (customDatasources.firefox, a security release) and the runners (github-runners, runs-on)",
       "matchDatasources": [
         "github-releases",
         "github-release-attachments",
@@ -121,7 +120,7 @@
       "minimumReleaseAge": "3 days"
     },
     {
-      "description": "Every action is pinned to a commit for an exact version tag, so a digest update of one means that tag was moved to a different commit, which is what a hijacked action looks like (tj-actions/changed-files, 2025). Never automerged, never mixed into the weekly PR (one non-automerge update would hold the whole group), opened at once",
+      "description": "Every action is pinned to a commit for an exact version tag, so a digest update of one means that tag was moved to a different commit, which is what a hijacked action looks like (tj-actions/changed-files, 2025). Never automerged, never in a directory's PR (one update that does not merge itself would hold the whole PR), opened at once, without the 3-day wait",
       "matchManagers": [
         "github-actions"
       ],
@@ -131,16 +130,13 @@
       "groupName": "moved GitHub action tags",
       "groupSlug": "action-retag",
       "automerge": false,
-      "schedule": [
-        "at any time"
-      ],
       "addLabels": [
         "security"
       ],
       "minimumReleaseAge": "0 days"
     },
     {
-      "description": "A digest update of an unchanged version means that what the version names was replaced upstream, as with a moved GitHub action tag: a release built from its git tag, pinned to the tag's commit as well (a _COMMIT beside the version: REMMINA_COMMIT in apps/org.remmina.Remmina/Containerfile, a GitLab tag; ZYPAK_COMMIT in apps/io.github.lucarickli.Code/Containerfile, a GitHub tag), or an image pinned to its tag's digest as well (the builder's BuildKit in build/build.sh). A new release moves both in one update, which automerges. Never automerged, never in the weekly PR, opened at once. Not a release file pinned by its sha256 (sha256:<hex> in tools/tools.txt and tools/extensions.txt, the github-release-attachments datasource): a new release moves version and sha256 together, but Renovate never reports a file replaced at the same version (it looks up a new digest only for a new version); install.sh catches that when the Monday builds download it again, and notify.yml opens the issue. The custom managers only: an action's tag is a github-tags dependency too, and has its own group above",
+      "description": "A digest update of an unchanged version means that what the version names was replaced upstream, as with a moved GitHub action tag: a release built from its git tag, pinned to the tag's commit as well (a _COMMIT beside the version: REMMINA_COMMIT in apps/org.remmina.Remmina/Containerfile, a GitLab tag; ZYPAK_COMMIT in apps/io.github.lucarickli.Code/Containerfile, a GitHub tag), or an image pinned to its tag's digest as well (the builder's BuildKit in build/build.sh). A new release moves both in one update, which automerges. Never automerged, never in a directory's PR, opened at once, without the 3-day wait. Not a release file pinned by its sha256 (sha256:<hex> in tools/tools.txt and tools/extensions.txt, the github-release-attachments datasource): a new release moves version and sha256 together, but Renovate never reports a file replaced at the same version (it looks up a new digest only for a new version); install.sh catches that when the Monday builds download it again, and notify.yml opens the issue. The custom managers only: an action's tag is a github-tags dependency too, and has its own group above",
       "matchManagers": [
         "custom.regex"
       ],
@@ -150,9 +146,6 @@
       "groupName": "moved git tags",
       "groupSlug": "git-retag",
       "automerge": false,
-      "schedule": [
-        "at any time"
-      ],
       "addLabels": [
         "security"
       ],
@@ -169,14 +162,16 @@
       "allowedVersions": "/^v[\\d.]+$/"
     },
     {
-      "description": "Claude Code (CLAUDE_VERSION in apps/io.github.lucarickli.Code/Containerfile and devcontainer/Containerfile) follows Anthropic's stable channel, the npm dist-tag 'stable': a release about a week old, skipping those with major regressions, instead of every daily one",
+      "description": "Claude Code (CLAUDE_VERSION in apps/io.github.lucarickli.Code/Containerfile and devcontainer/Containerfile) follows Anthropic's stable channel, the npm dist-tag 'stable': a release about a week old, skipping those with major regressions, instead of every daily one. Both pins in one PR of their own, out of their directories': ci.yml's lint (and devcontainer.yml) fails while they differ, so a PR that moved one of them would never merge",
       "matchDatasources": [
         "npm"
       ],
       "matchPackageNames": [
         "@anthropic-ai/claude-code"
       ],
-      "followTag": "stable"
+      "followTag": "stable",
+      "groupName": "Claude Code",
+      "groupSlug": "claude-code"
     },
     {
       "description": "The Fedora base images are not managed as docker tags: the registry carries the next release (branched) and rawhide as plain numbers long before they are released, so a docker lookup would propose rawhide. The fedora custom manager below follows released Fedora versions instead",
@@ -203,20 +198,17 @@
       "enabled": false
     },
     {
-      "description": "Firefox (FIREFOX_VERSION in apps/org.mozilla.firefox/Containerfile) follows Mozilla's current release, the one version product-details.mozilla.org names (customDatasources.firefox): N.0, then its dot releases N.0.x, in loose versioning. A browser release is a security update, so every one, each new N (a major) too, gets a PR of its own at any time, not on the weekend schedule, in a group of its own instead of the weekly one, and automerges once ci-ok is green",
+      "description": "Firefox (FIREFOX_VERSION in apps/org.mozilla.firefox/Containerfile) follows Mozilla's current release, the one version product-details.mozilla.org names (customDatasources.firefox): N.0, then its dot releases N.0.x, in loose versioning. A browser release is a security update: it names no release time, so it has no 3-day wait and is opened as soon as Mozilla names it, each new N (a major) too, in a PR of its own, which nothing else in its directory can hold back, and automerges once ci-ok is green",
       "matchDatasources": [
         "custom.firefox"
       ],
       "versioning": "loose",
       "groupName": "Firefox",
       "groupSlug": "firefox",
-      "schedule": [
-        "at any time"
-      ],
       "automerge": true
     },
     {
-      "description": "The move to the next Fedora release: every pin in one PR, opened 3 days after endoflife.date gives its release date (not on the weekend after), which merges itself once ci-ok is green, as a major does: the dev container, the runtime, the SDK and every app on them build and test on it first",
+      "description": "The move to the next Fedora release: every pin, in every directory, in one PR, opened 3 days after endoflife.date gives its release date, which merges itself once ci-ok is green, as a major does: the dev container, the runtime, the SDK and every app on them build and test on it first",
       "matchDatasources": [
         "endoflife-date"
       ],
@@ -229,9 +221,6 @@
       "commitMessageTopic": "Fedora",
       "addLabels": [
         "renovate/fedora"
-      ],
-      "schedule": [
-        "at any time"
       ]
     }
   ],

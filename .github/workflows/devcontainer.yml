@@ -3,7 +3,10 @@
 # its ai stage (the same with Claude Code) as :ai and :<yyyymmdd>-ai. Both
 # are signed with the OS's cosign key: on a machine running the OS, podman
 # refuses them unsigned (its policy.json), so toolbox and Dev Containers on
-# podman do too; docker reads no policy.json. Baked (build/docker-bake.hcl,
+# podman do too; docker reads no policy.json. So build pushes the dated
+# tags alone, sign signs them, and promote moves :latest and :ai to them
+# once both signatures verify: a sign or promote that fails leaves both on
+# the images before, signed. Baked (build/docker-bake.hcl,
 # the devcontainer targets) on the registry cache flatpaks.yml's jobs use
 # too, ghcr.io/<owner>/packages-cache, which only a run on main writes
 # (build/ci.sh). Weekly as well, and by hand, built again without the cache
@@ -41,9 +44,9 @@ on:
   workflow_call:
 
 # Only pull requests supersede each other. Any other run waits for the one
-# before it, which, cancelled between its push and `sign`, would leave the
-# tags on an unsigned image; one still pending when a newer one queues is
-# dropped (the newer one builds the same, and newer).
+# before it, which, cancelled between its push and `promote`, would leave
+# dated tags unsigned or unpromoted; one still pending when a newer one
+# queues is dropped (the newer one builds the same, and newer).
 concurrency:
   group: devcontainer-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -235,14 +238,12 @@ jobs:
           upstream-paths: usr/local/ var/home/dev/.vscode-server/
           require: ${{ inputs.security }}
 
-      # Each tag's digest, for `sign` (an image's two tags are the same
-      # manifest, which skopeo copies from the layout byte for byte, so one
-      # digest each), recorded as soon as it is pushed: `sign` signs
-      # whatever was, also when a later push fails, as a machine refuses an
-      # unsigned tag. One date for both images, also when the push runs
-      # past midnight. The dated tags first, the moving ones last: a push
-      # that fails leaves at most one moving tag moved (:latest, when :ai
-      # fails), and signed. skopeo retries each push, and each is tried
+      # The dated tags alone; :latest and :ai are promote's. Each digest
+      # (skopeo copies the manifest from the layout byte for byte) goes in a
+      # file named after the moving tag it is for, pushed/devcontainer/latest
+      # and /ai, as soon as it is pushed: `sign` signs whatever was, also
+      # when the second push fails. One date for both images, also when the
+      # push runs past midnight. skopeo retries each push, and each is tried
       # three times, 30 s apart. Nothing goes to a package that is public
       # (build/private.sh): the images are the owner's alone.
       - name: Push
@@ -253,8 +254,8 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/devcontainer"
           build/private.sh "$image"
           day=$(date -u +%Y%m%d)
-          mkdir -p "${RUNNER_TEMP}/pushed"
-          # push LAYOUT TAG
+          mkdir -p "${RUNNER_TEMP}/pushed/devcontainer"
+          # push LAYOUT TAG MOVING: LAYOUT as TAG, its digest for MOVING
           push() {
             local attempt
             for attempt in 1 2 3; do
@@ -263,14 +264,11 @@ jobs:
               echo "push of $image:$2 failed (attempt $attempt), retrying in 30s" >&2
               sleep 30
             done
-            echo "${image}@$(cat "${RUNNER_TEMP}/digest")" >> "${RUNNER_TEMP}/pushed/devcontainer"
-            sort -u -o "${RUNNER_TEMP}/pushed/devcontainer" "${RUNNER_TEMP}/pushed/devcontainer"
+            echo "${image}@$(cat "${RUNNER_TEMP}/digest")" > "${RUNNER_TEMP}/pushed/devcontainer/$3"
             echo "pushed=true" >> "$GITHUB_OUTPUT"
           }
-          push output/images/devcontainer "$day"
-          push output/images/devcontainer-ai "$day-ai"
-          push output/images/devcontainer latest
-          push output/images/devcontainer-ai ai
+          push output/images/devcontainer "$day" latest
+          push output/images/devcontainer-ai "$day-ai" ai
 
       - name: Record the digest
         if: always() && steps.push.outputs.pushed == 'true'
@@ -283,10 +281,9 @@ jobs:
           overwrite: true
 
   # The cosign key in a job of its own that runs nothing but checkout, the
-  # artifact download and cosign (.github/actions/sign has the why). Until it
-  # has run, the new tags are unsigned, and a machine refuses to pull them:
-  # so it runs whenever anything was pushed, also when the build job failed
-  # after that.
+  # artifact download and cosign (.github/actions/sign has the why),
+  # whenever anything was pushed, also when the build job failed after
+  # that: no dated tag stays unsigned.
   sign:
     name: sign
     needs: build
@@ -317,3 +314,40 @@ jobs:
           refs-dir: ${{ runner.temp }}/pushed
           cosign-key: ${{ secrets.SIGNING_SECRET }}
           registry-token: ${{ github.token }}
+
+  # :latest and :ai, without the key: once build and sign both succeeded,
+  # build/ci.sh promote verifies both signatures against keys/cosign.pub
+  # (cosign, installed and checked as the sign action does), then moves
+  # each tag to its digest within the registry. A failure leaves them on
+  # the images before, signed.
+  promote:
+    name: promote
+    needs: [build, sign]
+    if: needs.build.result == 'success' && needs.sign.result == 'success'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read    # keys/cosign.pub, build/ci.sh
+      packages: write   # :latest and :ai
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The pushed digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pushed-devcontainer
+          path: ${{ runner.temp }}/pushed/devcontainer
+
+      # The sign action's pin, which Renovate bumps together.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
+
+      - name: Promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: build/ci.sh promote devcontainer

@@ -1,25 +1,33 @@
 # One Flatpak's pipeline, called by flatpaks.yml for each Flatpak its plan
 # builds (`build/build.sh names`), so that each is built, tested, pushed,
-# signed and indexed on its own: one that fails, or is slow (the VS Code
-# Flatpak), holds back no other's release. Its jobs, `<name> / build`,
-# `<name> / sign` and `<name> / index`, are what build/ci.sh's plan reads
-# of the runs before (lookup): a Flatpak counts as published once its build
-# job succeeded and, where it pushed, its sign job too.
+# signed, promoted and indexed on its own: one that fails, or is slow (the
+# VS Code Flatpak), holds back no other's release. Its jobs, `<name> /
+# build`, `<name> / sign`, `<name> / promote` and `<name> / index`, are
+# what build/ci.sh's plan reads of the runs before (lookup): a Flatpak
+# counts as published once its build job succeeded and, where it pushed,
+# its promote job too.
+#
+# Machines follow the moving tag (:latest, or :ai for VS Code's ai), which
+# only promote moves, and only to a digest whose signature verifies: a sign
+# or promote that fails leaves it on the image before, signed.
 #
 # - build: `build/ci.sh build NAME` (its runtime of the run's cache, its
 #   images, the Flatpak made and tested), the scan where its image gets one,
-#   then `build/ci.sh push NAME` where the plan pushes it, on main only.
-#   `built` once it passed its test (the jobs on a runtime go on although
-#   its scan or push fails), `pushed` once any tag is pushed, `digest` the
-#   moving tag's, which the apps on a runtime are tested on.
+#   then `build/ci.sh push NAME` where the plan pushes it, on main only: the
+#   dated tag alone. `built` once it passed its test (the jobs on a runtime
+#   go on although its scan or push fails), `pushed` once the tag is
+#   pushed, `digest` its digest, which the apps on a runtime are tested on.
 # - sign: the cosign key, in a job of its own in the release environment
 #   that runs nothing but checkout, the artifact download and cosign
-#   (.github/actions/sign has the why), whenever build pushed anything, also
-#   where a later tag failed.
+#   (.github/actions/sign has the why), whenever build pushed.
+# - promote: no key. `build/ci.sh promote NAME` verifies the signature
+#   against keys/cosign.pub, then moves the moving tag to that digest; for
+#   an app on a runtime this run was to push, only once that runtime's
+#   pipeline promoted it. Once build and sign succeeded.
 # - index: has pages.yml publish the Flatpak remote again, of what ghcr.io
-#   has now, once this one pushed: at once, not after the slowest Flatpak
-#   of the run. Its failure fails nothing here (continue-on-error): the
-#   next pipeline, or a run of pages.yml by hand, publishes it.
+#   has now, once this one is promoted: at once, not after the slowest
+#   Flatpak of the run. Its failure fails nothing here (continue-on-error):
+#   the next pipeline, or a run of pages.yml by hand, publishes it.
 name: flatpak
 
 on:
@@ -86,7 +94,7 @@ on:
         description: '"true" once the Flatpak passed its test'
         value: ${{ jobs.build.outputs.built }}
       digest:
-        description: the digest pushed as the moving tag
+        description: the digest pushed as the dated tag, which promote moves the moving tag to
         value: ${{ jobs.build.outputs.digest }}
 
 defaults:
@@ -194,9 +202,9 @@ jobs:
           BASE_PUSH: ${{ inputs.base-push }}
         run: build/ci.sh push "$NAME"
 
-      # Whatever it pushed, also when a later tag failed: a tag that was
-      # pushed is signed (sign). Kept 90 days, beyond the 30 a run can be
-      # re-run in.
+      # The digest pushed, in a file named after the moving tag it is for:
+      # what sign signs and promote moves that tag to. Kept 90 days, beyond
+      # the 30 a run can be re-run in.
       - name: Record the digests
         if: always() && steps.push.outputs.pushed == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -241,12 +249,55 @@ jobs:
           cosign-key: ${{ secrets.SIGNING_SECRET }}
           registry-token: ${{ github.token }}
 
+  # The moving tag, without the key: cosign checks the signature the way
+  # the sign action does (installed and checked by cosign-installer, the
+  # committed public key, no transparency log), then skopeo copies the
+  # digest to the moving tag within the registry (build/ci.sh promote).
+  # Only after a build and a sign that both succeeded, so only ever on
+  # main; a failure here leaves the moving tag where it was.
+  promote:
+    name: promote
+    needs: [build, sign]
+    if: needs.build.result == 'success' && needs.sign.result == 'success'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read    # keys/cosign.pub, build/ci.sh
+      packages: write   # the moving tag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The pushed digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pushed-flatpak-${{ inputs.name }}
+          path: ${{ runner.temp }}/pushed/${{ inputs.name }}
+
+      # The sign action's pin, which Renovate bumps together.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
+
+      # GH_TOKEN for a re-run (build/ci.sh behind) and the registry;
+      # BASE_* for an app's runtime, as its Push step has them.
+      - name: Promote
+        env:
+          NAME: ${{ inputs.name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BASE_RESULT: ${{ inputs.base-result }}
+          BASE_READY: ${{ inputs.base-ready }}
+          BASE_PUSH: ${{ inputs.base-push }}
+        run: build/ci.sh promote "$NAME"
+
   index:
     name: index
-    needs: [build, sign]
-    if: >-
-      always() && needs.build.outputs.pushed == 'true' &&
-      github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: promote
+    if: needs.promote.result == 'success'
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     continue-on-error: true
