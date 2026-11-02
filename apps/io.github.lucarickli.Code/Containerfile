@@ -1,0 +1,355 @@
+# io.github.lucarickli.Code: VS Code with the development tools of
+# tools/tools.txt, so that its terminal (fish, with your dotfiles) is a
+# development environment of its own, on io.github.lucarickli.Sdk
+# (runtime/sdk/), the runtime with Fedora's C toolchain, gdb and git. The
+# app is /app alone: VS Code, from Microsoft's RPM of the release, in
+# /app/lib/vscode; zypak, which gives Chromium its sandbox inside flatpak's;
+# the tools (install.sh), the VS Code extensions for a first start offline
+# (extensions.txt) and mise's system part (mise-system.sh); around them,
+# from files/ at the same paths, the launchers and desktop files. Two
+# variants of the one app, io.github.lucarickli.Code//stable: plain, the
+# flatpak stage, and ai, the flatpak-ai stage, which is plain with Claude
+# Code (its files in files-ai/), pushed as ghcr.io/<owner>/code :latest and
+# :ai (README.md). The labels of the flatpak stage have the
+# permissions, the same for both; the test and test-ai stages are each
+# variant with test.sh as its command. x86_64 only.
+#
+# VS Code and Claude Code are in the image, where Flathub's
+# com.visualstudio.code has flatpak download VS Code on each machine
+# (extra-data): the images are private, for the owner's machines. Every
+# download is checked: VS Code's RPM against Microsoft's signature on it,
+# Claude Code against the manifest Anthropic signs
+# (tools/claude-code.sh), zypak by its commit, the tools by install.sh.
+# README.md has what differs from Flathub's com.visualstudio.code and why.
+#
+# Build contexts (build/docker-bake.hcl): this directory; tools/ and keys/
+# as the contexts named tools and keys; and the SDK's image, the flatpak
+# stage of runtime/sdk/Containerfile, as the context named sdk, which the
+# build stages are FROM. The SDK's branch is named once here, in
+# flatpak.runtime below, and a build without the context fails at once.
+
+# tools/ for the RUNs below, bound from stages rather than straight from
+# the build context, so that only a change to the files a stage copies
+# reruns what binds it (tools/test.sh and the pin check change nothing
+# here). Claude Code's pin in a stage of its own, so that a change to it
+# rebuilds only ai; as in the checkout, the script finds the key at
+# ../keys/.
+FROM scratch AS devtools
+COPY --from=tools tools.txt extensions.txt install.sh mise-system.sh mise-config.toml /
+
+FROM scratch AS claude-code
+COPY --from=tools claude-code.sh /tools/
+COPY --from=keys claude-code.asc /keys/
+
+# --- build: on the SDK's image, so that the checks below run against the
+# libraries the app will run with; only /app leaves it ---------------------
+FROM sdk AS build
+
+# What only the build needs, and so only this stage has: zypak's headers
+# (libsystemd's, D-Bus'), GraphicsMagick for the icon, desktop-file-validate.
+# The metadata first, retried, as for the runtime.
+RUN for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done \
+    && dnf -y --setopt=install_weak_deps=False install \
+        systemd-devel dbus-devel GraphicsMagick desktop-file-utils \
+    && dnf clean all
+
+# The tools into /app (install.sh: Go in /app/go, Rust in /app/rustup and
+# /app/cargo, each tool's license texts in /app/share/licenses), and the
+# language extensions as .vsix files in /app/share/vscode/vsix, which the
+# launcher (files/bin/code) installs into a new profile where the
+# Marketplace cannot. Go's own compiler test suite goes: not needed to use
+# Go, and the only file names in /app that are not ASCII, which flatpak
+# build-bundle's libarchive takes only in a UTF-8 locale (checked below).
+# mise's settings, and the Go and Deno above as its installs
+# (mise-system.sh), in /app/etc/mise and /app/share/mise, which the labels
+# name. fish and bcvk move to /app/libexec, behind the wrappers of their
+# name in files/bin: fish with your dotfiles, bcvk run on the host.
+RUN --mount=type=bind,from=devtools,source=/,target=/run/devtools \
+    /run/devtools/install.sh /app \
+    && /run/devtools/install.sh --list /run/devtools/extensions.txt /app \
+    && rm -rf /app/go/test \
+    && /run/devtools/mise-system.sh /app /app/etc/mise \
+    && mkdir -p /app/libexec && mv /app/bin/fish /app/bin/bcvk /app/libexec/
+
+# VS Code: Microsoft's RPM of the release, its URL and sha256 from the
+# update API, which must name this version. Then the RPM's signature, by
+# Microsoft's release key, which rpm checks against a database of its own
+# holding that key alone: the key file Microsoft publishes
+# (https://packages.microsoft.com/keys/microsoft.asc), which counts only as
+# the one key of the fingerprint pinned here, the one Microsoft gives for it
+# (https://learn.microsoft.com/linux/packages), so another key in that file,
+# or one more, fails. Its signed header must name this version, so an older
+# release, signed as well, cannot stand in. rpm 6 passes an unsigned
+# package as "digests OK", hence the whole line. A new signing key
+# (microsoft-2025.asc signs Microsoft's newer repositories) fails the build
+# until it is pinned here. The app is the RPM's /usr/share/code, the
+# linux-x64 tarball's tree but for seven development files in its built-in
+# extensions (.npmrc, .gitignore, .vscode/launch.json, ...), unpacked with
+# rpm's rpm2archive; its chrome-sandbox is setuid root there, for
+# Chromium's own sandbox, which zypak's replaces in here, and no setuid bit
+# works in a flatpak sandbox (no_new_privs): 0755, as in the tarball. The
+# icon is its own, 1024 pixels square, scaled to 512: flatpak build-export
+# takes no larger PNG, in whatever directory.
+# renovate: datasource=github-releases depName=microsoft/vscode
+ARG VSCODE_VERSION=1.142.0
+RUN set -eux; \
+    key=BC528686B50D79E339D3721CEB3E94ADBE1229CF; \
+    info=$(curl -fsSL --retry 5 --retry-all-errors "https://update.code.visualstudio.com/api/versions/$VSCODE_VERSION/linux-rpm-x64/stable"); \
+    test "$(printf '%s' "$info" | jq -r .productVersion)" = "$VSCODE_VERSION"; \
+    url=$(printf '%s' "$info" | jq -er '.url | select(startswith("https://"))'); \
+    sha=$(printf '%s' "$info" | jq -er '.sha256hash | select(test("^[0-9a-f]{64}$"))'); \
+    work=$(mktemp -d); cd "$work"; \
+    curl -fsSL --retry 5 --retry-all-errors -o code.rpm "$url"; \
+    curl -fsSL --retry 5 --retry-all-errors -o microsoft.asc https://packages.microsoft.com/keys/microsoft.asc; \
+    echo "$sha  code.rpm" | sha256sum -c --quiet -; \
+    export GNUPGHOME="$work/gnupg"; mkdir -m 700 "$GNUPGHOME"; \
+    test "$(gpg --batch --show-keys --with-colons microsoft.asc | awk -F: '$1 == "fpr" { print $10 }')" = "$key"; \
+    mkdir rpmdb; \
+    rpmkeys --dbpath "$work/rpmdb" --import microsoft.asc; \
+    test "$(rpmkeys --dbpath "$work/rpmdb" --checksig code.rpm)" = "code.rpm: digests signatures OK"; \
+    test "$(rpm --dbpath "$work/rpmdb" -qp --qf '%{NAME} %{VERSION}' code.rpm)" = "code $VSCODE_VERSION"; \
+    mkdir root; \
+    rpm2archive -n - <code.rpm | tar -x -C root; \
+    mkdir -p /app/lib; \
+    mv root/usr/share/code /app/lib/vscode; \
+    chmod 0755 /app/lib/vscode/chrome-sandbox; \
+    cd /; rm -rf "$work"; \
+    test "$(jq -r .version /app/lib/vscode/resources/app/package.json)" = "$VSCODE_VERSION"; \
+    install -d /app/share/icons/hicolor/512x512/apps; \
+    gm convert /app/lib/vscode/resources/app/resources/linux/code.png -resize 512x512 \
+        /app/share/icons/hicolor/512x512/apps/io.github.lucarickli.Code.png
+
+# zypak: Chromium's sandbox through flatpak's portal, built as Flathub's
+# Electron BaseApp builds it (branch 26.08 of its manifest: this tag and
+# commit). Upstream publishes no release files, so it comes from its git
+# tag, which git checks against the commit pinned with it; the submodule
+# (nickle) at the commit the tag records. Its license next to the tools'.
+# renovate: datasource=github-tags depName=refi64/zypak
+ARG ZYPAK_VERSION=v2025.09 ZYPAK_COMMIT=693a71c5ffa80ec9c9ce2ae03b1ccc493c698e53
+RUN set -eux; \
+    work=$(mktemp -d); \
+    for i in 1 2 3; do \
+        git clone -q --depth 1 --branch "$ZYPAK_VERSION" --recurse-submodules --shallow-submodules \
+            https://github.com/refi64/zypak "$work/zypak" && break; \
+        rm -rf "$work/zypak"; [ "$i" != 3 ] || exit 1; sleep 30; \
+    done; \
+    test "$(git -C "$work/zypak" rev-parse HEAD)" = "$ZYPAK_COMMIT"; \
+    make -C "$work/zypak" -j"$(nproc)"; \
+    make -C "$work/zypak" install FLATPAK_DEST=/app; \
+    install -Dm644 "$work/zypak/LICENSE" /app/share/licenses/zypak/LICENSE; \
+    rm -rf "$work"
+
+COPY files/ /app/
+
+# podman, docker, qemu-img and qemu-system-x86_64 are the host's, through
+# host-command. Then the app as it will run: every library VS Code, its
+# native modules and zypak link is theirs or the SDK's, as the sandbox has
+# no other (ldd, with VS Code's dir, from which it loads its own); all but
+# the Microsoft Account extension's broker (MSAL's runtime), which links
+# WebKitGTK: neither this SDK nor Flathub's has it, and without it the
+# extension signs in through the browser. The launchers are executable,
+# the desktop files valid, every file name ASCII, and no file setuid or
+# setgid.
+RUN set -eux; \
+    for c in podman docker qemu-img qemu-system-x86_64; do ln -s ../libexec/host-command "/app/bin/$c"; done; \
+    missing=$(find /app/lib/vscode /app/lib/libzypak-*.so /app/bin/zypak-helper /app/bin/zypak-sandbox \
+        -type f \( -name '*.so*' -o -name '*.node' -o -perm -u+x \) \
+        ! -path '/app/lib/vscode/resources/app/extensions/microsoft-authentication/dist/*' \
+        -exec env LD_LIBRARY_PATH=/app/lib/vscode:/app/lib ldd {} + 2>/dev/null | grep 'not found' || :); \
+    test -z "$missing"; \
+    for f in bin/code bin/code-wait bin/fish bin/bcvk bin/zypak-wrapper.sh libexec/host-command libexec/fish; do \
+        test -x "/app/$f"; \
+    done; \
+    desktop-file-validate /app/share/applications/io.github.lucarickli.Code.desktop \
+        /app/share/applications/io.github.lucarickli.Code-url-handler.desktop; \
+    test -z "$(LC_ALL=C find /app -name '*[! -~]*' | head -n 1)"; \
+    test -z "$(find /app -perm /6000 | head -n 1)"
+
+# --- Claude Code, for ai: Anthropic's release for linux-x64, its zstd file
+# (about a third of the size), whose URL, sha256 and size come from the manifest
+# Anthropic signs for the release, checked against its key
+# (tools/claude-code.sh). Its own stage, so that plain's layers never
+# depend on it ------------------------------------------------------------
+FROM sdk AS claude
+# Anthropic's stable channel (.github/renovate.json follows its npm
+# dist-tag); the dev container's pin (devcontainer/Containerfile) moves with
+# it.
+# renovate: datasource=npm depName=@anthropic-ai/claude-code
+ARG CLAUDE_VERSION=2.1.285
+RUN --mount=type=bind,from=claude-code,source=/,target=/run/claude-code \
+    set -eux; \
+    pin=$(/run/claude-code/tools/claude-code.sh --zst "$CLAUDE_VERSION"); \
+    set -- $pin; test "$#" = 3; url=$1 sha=$2 size=$3; \
+    work=$(mktemp -d); \
+    curl -fsSL --retry 5 --retry-all-errors -o "$work/claude.zst" "$url"; \
+    test "$(stat -c %s "$work/claude.zst")" = "$size"; \
+    echo "$sha  $work/claude.zst" | sha256sum -c --quiet -; \
+    install -d /out/libexec; \
+    zstd -dq "$work/claude.zst" -o /out/libexec/claude; \
+    chmod 0755 /out/libexec/claude; \
+    test "$(HOME=$work DISABLE_UPDATES=1 /out/libexec/claude --version)" = "$CLAUDE_VERSION (Claude Code)"; \
+    test -z "$(ldd /out/libexec/claude | grep 'not found' || :)"; \
+    rm -rf "$work"
+
+# --- the app: /app, nothing else, and the flatpak.* labels ------------------
+# FROM scratch, so that none of the SDK image's labels (its ID, its
+# environment, its GL extension point) carry over into the app's.
+FROM scratch AS flatpak
+COPY --from=build /app /app
+
+# The app's ID; the runtime it runs on, whose branch is Fedora's release
+# (runtime/sdk/Containerfile); the command, the launcher (files/bin/code).
+# The branch is flatpak.branch's default, stable, which the machines'
+# remotes name.
+LABEL flatpak.id=io.github.lucarickli.Code \
+      flatpak.runtime=io.github.lucarickli.Sdk//44 \
+      flatpak.command=code
+
+# The permissions: a sandbox, with host access an opt-in
+# (README.md), the same for both variants, one group for each
+# reason. Granted, first, the network (Marketplace, git, downloads, dev
+# servers on the host's localhost), the Wayland display (X11 only where
+# there is none), the GPU (dri), and ptrace and perf for dlv, gdb and
+# strace (devel).
+LABEL flatpak.finish-args.desktop="\
+    --share=network \
+    --socket=wayland \
+    --socket=fallback-x11 \
+    --device=dri \
+    --allow=devel"
+
+# /dev/kvm, where the host has one, for VMs started in here, and in
+# claude-sandboxed's box, which the portal passes it on to only where the
+# app has it. It is the host kernel's KVM, for every process in here: more
+# of the kernel to reach, no more of the host's files, as a guest gets what
+# the process that starts it hands it. The app's qemu-system-x86_64 is the
+# host's (host-command), which uses the host's; this is for the other users
+# of KVM, a qemu or VMM that a project brings, a test that boots one.
+LABEL flatpak.finish-args.kvm=--device=kvm
+
+# /run/docker.sock, the Docker daemon's socket where the host runs one
+# (/var/run/docker.sock in here too, so clients find it without
+# DOCKER_HOST), usable as far as you are in its docker group: for what
+# speaks Docker's API in here (testcontainers, the Docker extension, SDKs).
+# That is root on the host, as docker through host access is, so on a host
+# with Docker this sandbox holds nothing back from what runs in it. Not in
+# claude-sandboxed's box.
+LABEL flatpak.finish-args.docker=--filesystem=/run/docker.sock
+
+# ssh-auth: git over SSH signs with the session's agent and never reads a
+# key; ~/.ssh/known_hosts and config come as single files, read-only.
+LABEL flatpak.finish-args.ssh="\
+    --socket=ssh-auth \
+    --filesystem=~/.ssh/known_hosts:ro \
+    --filesystem=~/.ssh/config:ro"
+
+# ~/Developer, the projects, read-write (made if missing), and your fish and
+# git configuration, read-only.
+LABEL flatpak.finish-args.files="\
+    --filesystem=~/Developer:create \
+    --filesystem=~/.config/fish:ro \
+    --filesystem=~/.gitconfig:ro \
+    --filesystem=xdg-config/git:ro"
+
+# ~/go, ~/.cargo, ~/.deno and ~/.vscode, kept in the app's own directory
+# (the rest of the home in here is a tmpfs, new at each start): what `go
+# install` and the like build, the module and crate caches, VS Code's
+# argv.json.
+LABEL flatpak.finish-args.persist="\
+    --persist=go \
+    --persist=.cargo \
+    --persist=.deno \
+    --persist=.vscode"
+
+# Notifications, for the toasts. libnotify would use the portal, but which
+# backend serves it on labwc, wayfire and river is untested, and the name
+# only lets the app post notifications that look like another's.
+LABEL flatpak.finish-args.notifications=--talk-name=org.freedesktop.Notifications
+
+# Not granted, each a way out or more than VS Code needs:
+# - host. Since flatpak 1.17 it brings the host's whole / at /run/host/root
+#   as well: the unfiltered session and system buses, niri's IPC socket,
+#   podman's socket dir, the host's /proc. That makes every other limit here
+#   moot, so leaving it out is the largest reduction of all.
+# - org.freedesktop.Flatpak: any command on the host, through host-spawn. One
+#   override grants it, for Dev Containers, podman and the VM recipes;
+#   host-command prints it where it is missing.
+# - /tmp: the launcher's TMPDIR, a directory the host sees at the same path,
+#   carries what Dev Containers hands the host's podman, and the host's
+#   EDITOR passes its files in through the document portal
+#   (tools/README.md, EDITOR).
+# - org.freedesktop.secrets: every item in the login keyring, not only VS
+#   Code's; sign-ins stay in the profile (the launcher's --password-store).
+# - login1: power off, reboot and inhibit without a password, for VS Code's
+#   suspend events only. Every device beyond the GPU and KVM (input, uinput,
+#   hidraw, cameras), pulseaudio (and so the microphone), and ipc (X11
+#   shared memory, a speed-up only).
+#
+# The environment. PATH: the tools in /app, the toolchains' bin dirs; the
+# launcher adds the per-user ones (files/bin/code). RUSTUP_HOME: the Rust
+# toolchain in /app; DENO_NO_UPDATE_CHECK: Deno is the app's version.
+# LD_LIBRARY_PATH and XCURSOR_PATH as Flathub's com.visualstudio.code sets
+# them: /app/lib, which holds zypak's libraries here, in place of the
+# runtime's /app/lib64, where this app has none; the host's cursor themes
+# only, which its manifest gives for the cursor's scaling on Wayland.
+LABEL flatpak.finish-args.env="\
+    --env=PATH=/app/bin:/app/go/bin:/app/cargo/bin:/usr/bin \
+    --env=RUSTUP_HOME=/app/rustup \
+    --env=DENO_NO_UPDATE_CHECK=1 \
+    --env=LD_LIBRARY_PATH=/app/lib \
+    --env=XCURSOR_PATH=/run/host/user-share/icons:/run/host/share/icons"
+
+# SHELL: the terminal runs fish from /app with your dotfiles, whatever the
+# caller's shell is. EDITOR and VISUAL: git, sops, kubectl and gh edit in VS
+# Code (code-wait, `code --wait` as one word: a label's option ends at the
+# first whitespace; it reaches the running window from any instance of the
+# app), never in a value inherited from the caller, such as the host's
+# `flatpak run ...`, which does not exist in here. GIT_EDITOR stays unset,
+# so a core.editor still wins for git.
+LABEL flatpak.finish-args.editor="\
+    --env=SHELL=/app/bin/fish \
+    --env=EDITOR=code-wait \
+    --env=VISUAL=code-wait"
+
+# MISE_SYSTEM_*: mise's system config and installs in /app, as /etc in here
+# is the runtime's. Its shims are not on this PATH, which cannot name a
+# per-user dir: the launcher adds them. The other MISE_*:
+# mise-config.toml's downloads, versions host and paranoid mode (a project's
+# mise config runs only as you trusted it, so not what claude-sandboxed adds
+# to it), also here: mise ranks the environment above every config file, so
+# a project's mise.toml, once trusted, cannot change them.
+LABEL flatpak.finish-args.mise="\
+    --env=MISE_SYSTEM_CONFIG_DIR=/app/etc/mise \
+    --env=MISE_SYSTEM_DATA_DIR=/app/share/mise \
+    --env=MISE_AUTO_INSTALL=0 \
+    --env=MISE_USE_VERSIONS_HOST=0 \
+    --env=MISE_USE_VERSIONS_HOST_TRACK=0 \
+    --env=MISE_PARANOID=1"
+
+# --- ai: plain with Claude Code, /app/libexec/claude behind /app/bin/claude
+# and claude-sandboxed (files-ai/; the launcher goes by the first), plain's
+# files and labels otherwise --------------------------------------------------
+FROM flatpak AS flatpak-ai
+COPY --from=claude /out/ /app/
+COPY files-ai/ /app/
+
+# Claude Code is the app's version: its own updater would put a newer one
+# in ~/.local/bin, and check its installation. For every process, the copy
+# the VS Code extension runs too, not only /app/bin/claude.
+LABEL flatpak.finish-args.ai="\
+    --env=DISABLE_UPDATES=1 \
+    --env=DISABLE_INSTALLATION_CHECKS=1"
+
+# --- the tests: each variant, its ID and its permissions, with test.sh as
+# its command, which flatpak.sh test runs in the installed app's sandbox; and
+# tools/test.sh with tools.txt next to it, which it runs, and extensions.txt,
+# the bundled extensions it expects -----------------------------------------
+FROM flatpak AS test
+COPY --from=tools test.sh tools.txt extensions.txt /app/lib/code-test/
+COPY --chmod=0755 test.sh /app/bin/code-test
+LABEL flatpak.command=code-test
+
+FROM flatpak-ai AS test-ai
+COPY --from=tools test.sh tools.txt extensions.txt /app/lib/code-test/
+COPY --chmod=0755 test.sh /app/bin/code-test
+LABEL flatpak.command=code-test

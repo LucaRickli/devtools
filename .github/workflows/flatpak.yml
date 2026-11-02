@@ -1,0 +1,270 @@
+# One Flatpak's pipeline, called by flatpaks.yml for each Flatpak its plan
+# builds (`build/build.sh names`), so that each is built, tested, pushed,
+# signed and indexed on its own: one that fails, or is slow (the VS Code
+# Flatpak), holds back no other's release. Its jobs, `<name> / build`,
+# `<name> / sign` and `<name> / index`, are what build/ci.sh's plan reads
+# of the runs before (lookup): a Flatpak counts as published once its build
+# job succeeded and, where it pushed, its sign job too.
+#
+# - build: `build/ci.sh build NAME` (its runtime of the run's cache, its
+#   images, the Flatpak made and tested), the scan where its image gets one,
+#   then `build/ci.sh push NAME` where the plan pushes it, on main only.
+#   `built` once it passed its test (the jobs on a runtime go on although
+#   its scan or push fails), `pushed` once any tag is pushed, `digest` the
+#   moving tag's, which the apps on a runtime are tested on.
+# - sign: the cosign key, in a job of its own in the release environment
+#   that runs nothing but checkout, the artifact download and cosign
+#   (.github/actions/sign has the why), whenever build pushed anything, also
+#   where a later tag failed.
+# - index: has pages.yml publish the Flatpak remote again, of what ghcr.io
+#   has now, once this one pushed: at once, not after the slowest Flatpak
+#   of the run. Its failure fails nothing here (continue-on-error): the
+#   next pipeline, or a run of pages.yml by hand, publishes it.
+name: flatpak
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: the Flatpak (build/build.sh names)
+        required: true
+        type: string
+      push:
+        description: whether the plan pushes it (on main only)
+        type: boolean
+        default: false
+      day:
+        description: the plan's date, of every tag of the run
+        type: string
+        default: ""
+      scan:
+        description: the image's scan before the push, "full" (Fedora's packages), "secrets" (an app's /app of upstream releases) or "none"
+        type: string
+        default: none
+      fresh:
+        description: built without the cache, for Fedora's updates (the runtime's, weekly and by hand)
+        type: boolean
+        default: false
+      disk:
+        description: GB that must be free on the runner (prepare-runner)
+        type: string
+        default: "20"
+      timeout:
+        description: minutes the build job may take
+        type: number
+        default: 40
+      base-result:
+        description: the result of the pipeline of the runtime it is built on, in this run (skipped where none ran)
+        type: string
+        default: ""
+      base-ready:
+        description: the plan's ready of that runtime
+        type: string
+        default: ""
+      base-push:
+        description: the plan's push of that runtime
+        type: string
+        default: ""
+      base-build:
+        description: the plan's build of that runtime
+        type: string
+        default: ""
+      base-digest:
+        description: the digest that runtime's pipeline pushed in this run
+        type: string
+        default: ""
+      security:
+        description: Fedora security updates the scan requires (flatpaks.yml's input)
+        type: string
+        default: ""
+    secrets:
+      SIGNING_SECRET:
+        description: the cosign key, the release environment's (passed by name, as an environment secret of a called workflow must be)
+        required: false
+    outputs:
+      built:
+        description: '"true" once the Flatpak passed its test'
+        value: ${{ jobs.build.outputs.built }}
+      digest:
+        description: the digest pushed as the moving tag
+        value: ${{ jobs.build.outputs.digest }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: ${{ inputs.timeout }}
+    permissions:
+      contents: read
+      packages: write          # the cache, the runtime's Flatpak, the push
+      security-events: write   # scan results to code scanning (scan-image)
+    outputs:
+      built: ${{ steps.built.outputs.built }}
+      digest: ${{ steps.push.outputs.digest }}
+      pushed: ${{ steps.push.outputs.pushed }}
+    env:
+      NAME: ${{ inputs.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare the runner
+        uses: ./.github/actions/prepare-runner
+        with:
+          need: ${{ inputs.disk }}
+
+      - name: Set up buildx
+        uses: ./.github/actions/buildx
+
+      # The cache is a private package: read on every run, a pull
+      # request's too (a fork's token reads at most), written on main.
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Built on this run's image of its runtime (of the cache), tested on
+      # the Flatpak of that runtime machines get (build/ci.sh whence): on
+      # main this run's where it pushed one (BASE_DIGEST), else the
+      # published one; on a pull request the published one where the PR
+      # does not change that runtime (BASE_BUILD false), else one made here.
+      # GH_TOKEN for a re-run, which writes no cache where main moved on.
+      - name: Build and test
+        env:
+          EVENT: ${{ github.event_name }}
+          FRESH: ${{ inputs.fresh }}
+          GH_TOKEN: ${{ github.token }}
+          BASE_RESULT: ${{ inputs.base-result }}
+          BASE_READY: ${{ inputs.base-ready }}
+          BASE_PUSH: ${{ inputs.base-push }}
+          BASE_BUILD: ${{ inputs.base-build }}
+          BASE_DIGEST: ${{ inputs.base-digest }}
+        run: build/ci.sh build "$NAME"
+
+      - name: Built
+        id: built
+        run: echo "built=true" >> "$GITHUB_OUTPUT"
+
+      # The image's name, lower case as the bake file tags it, its layout,
+      # and the code scanning category, the VS Code Flatpak's code and
+      # code-ai as before.
+      - name: Image
+        id: image
+        if: inputs.scan != 'none'
+        run: |
+          category=${NAME,,}
+          category=${category/#io.github.lucarickli.code/code}
+          {
+            echo "image=localhost/packages/${NAME,,}"
+            echo "layout=output/images/${NAME}"
+            echo "category=$category"
+          } >> "$GITHUB_OUTPUT"
+
+      # Before the push (.github/actions/scan-image): the runtime's and the
+      # SDK's Fedora packages, an app on the SDK's /app for secrets; on main
+      # only where it is pushed. An app on the runtime is its upstream's
+      # release with no rpm database: none.
+      - name: Scan
+        if: inputs.scan != 'none' && (inputs.push || github.ref != 'refs/heads/main')
+        uses: ./.github/actions/scan-image
+        with:
+          image: ${{ steps.image.outputs.image }}
+          layout: ${{ steps.image.outputs.layout }}
+          name: ${{ steps.image.outputs.category }}
+          secrets-only: ${{ inputs.scan == 'secrets' && 'true' || 'false' }}
+          require: ${{ inputs.scan == 'full' && inputs.security || '' }}
+
+      - name: Push
+        id: push
+        if: inputs.push && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DAY: ${{ inputs.day }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BASE_RESULT: ${{ inputs.base-result }}
+          BASE_READY: ${{ inputs.base-ready }}
+          BASE_PUSH: ${{ inputs.base-push }}
+        run: build/ci.sh push "$NAME"
+
+      # Whatever it pushed, also when a later tag failed: a tag that was
+      # pushed is signed (sign). Kept 90 days, beyond the 30 a run can be
+      # re-run in.
+      - name: Record the digests
+        if: always() && steps.push.outputs.pushed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pushed-flatpak-${{ inputs.name }}
+          path: ${{ runner.temp }}/pushed/${{ inputs.name }}
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: true
+
+  sign:
+    name: sign
+    needs: build
+    if: >-
+      !cancelled() && needs.build.outputs.pushed == 'true' &&
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    environment: release   # the cosign key
+    permissions:
+      contents: read    # keys/cosign.pub
+      packages: write   # the signatures
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # By name: missing (expired, or its upload failed), it fails this job,
+      # and the Flatpak counts as not published, so the next run on main
+      # pushes it again.
+      - name: The pushed digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pushed-flatpak-${{ inputs.name }}
+          path: ${{ runner.temp }}/pushed
+
+      - name: Sign and verify
+        uses: ./.github/actions/sign
+        with:
+          refs-dir: ${{ runner.temp }}/pushed
+          cosign-key: ${{ secrets.SIGNING_SECRET }}
+          registry-token: ${{ github.token }}
+
+  index:
+    name: index
+    needs: [build, sign]
+    if: >-
+      always() && needs.build.outputs.pushed == 'true' &&
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write   # starts pages.yml (workflow_dispatch), nothing else
+    steps:
+      # pages.yml runs one at a time, and one pending gives way to a newer
+      # one, which reads the registry later: a burst of pushes is a few
+      # deployments. Three tries, 30 s apart, as every API call.
+      - name: Publish the index again
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            gh workflow run pages.yml --ref main && exit 0
+            [ "$attempt" != 3 ] || exit 1
+            echo "starting pages.yml failed (attempt $attempt), retrying in 30s" >&2
+            sleep 30
+          done

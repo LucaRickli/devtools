@@ -1,0 +1,44 @@
+#!/bin/sh
+#
+# /app/libexec/firefox-prestart: prepares the sandbox before Firefox starts.
+# /app/bin/firefox, the app's launcher, runs it first.
+#
+#   firefox-prestart
+#
+# It is never fatal: Firefox starts whatever happens here.
+
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+
+# --- Downloads ---
+# The app's labels grant ~/Downloads, created when missing. But Firefox
+# takes its download directory from $XDG_CONFIG_HOME/user-dirs.dirs, which
+# flatpak provides only when the host has one. Without it, Firefox falls
+# back to ~/<its localized "Downloads">, a directory of the sandbox alone
+# that is gone when Firefox exits. So this names ~/Downloads, unless the
+# file exists. Once the host has a user-dirs.dirs, flatpak binds one made
+# from it over this file.
+if [ ! -e "$config/user-dirs.dirs" ]; then
+    # shellcheck disable=SC2016  # $HOME unexpanded, as user-dirs.dirs has it
+    mkdir -p "$config" &&
+        printf '%s\n' '# Written by /app/libexec/firefox-prestart: where Firefox saves downloads.' \
+            'XDG_DOWNLOAD_DIR="$HOME/Downloads"' >"$config/user-dirs.dirs"
+fi
+
+# --- Pywalfox ---
+# Firefox finds native-messaging hosts in ~/.mozilla (in the sandbox, the
+# app's own .mozilla) and in /usr/lib/mozilla, which is the runtime's. So
+# the manifest of /app/bin/pywalfox goes into ~/.mozilla. A manifest of
+# another host (its description is not ours) is left alone. Run
+# `pywalfox install --force` to replace it.
+template=/app/share/pywalfox/pywalfox.json
+manifest=$HOME/.mozilla/native-messaging-hosts/pywalfox.json
+if ! cmp -s "$template" "$manifest"; then
+    if [ ! -e "$manifest" ] ||
+        grep -qF '"description": "Noctalia Firefox theme native messaging host (Flatpak)"' "$manifest"; then
+        mkdir -p "${manifest%/*}" &&
+            cp "$template" "$manifest.new" &&
+            mv -f "$manifest.new" "$manifest"
+    fi
+fi
+
+exit 0

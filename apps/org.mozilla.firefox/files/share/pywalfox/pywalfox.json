@@ -1,0 +1,9 @@
+{
+  "name": "pywalfox",
+  "description": "Noctalia Firefox theme native messaging host (Flatpak)",
+  "path": "/app/bin/pywalfox",
+  "type": "stdio",
+  "allowed_extensions": [
+    "pywalfox@frewacom.org"
+  ]
+}

@@ -1,0 +1,90 @@
+# io.github.lucarickli.Sdk//44: the runtime (runtime/Containerfile) with a
+# development environment on top, the runtime of the VS Code Flatpak
+# (apps/io.github.lucarickli.Code), whose terminal is one: the C and C++
+# toolchain with CMake, Ninja, Meson and the autotools, gdb and strace, git
+# with LFS, the OpenSSH client, Perl, pip, the commands a terminal and its
+# scripts expect, and the libraries VS Code links that the runtime lacks.
+# What Flathub's Freedesktop Sdk gave that app's terminal before, but for
+# valgrind, ccache and every library's headers and tools (below, with their
+# cost). build/flatpak.sh makes it as it makes the runtime: /usr becomes
+# the runtime's files, /etc their etc, the labels the rest. The test stage,
+# last, is an app on it whose command is the test (test.sh). x86_64 only.
+#
+# A runtime of its own: a machine with an app on it downloads all of it,
+# the runtime's files included, as flatpak shares nothing between two
+# runtimes: 435 MB, 1.24 GB installed (its OCI image layout, measured November
+# 2026 with Fedora 44; the runtime then: 261 MB, 761 MB; the build systems,
+# CMake to gettext, are 33 MB and 94 MB of it).
+#
+# Its labels are the runtime's, which FROM carries over as it does any
+# label (build/flatpak.sh reads the image's config): the
+# environment and the GL extension point come with them, unchanged. Only
+# the ID is its own; the branch, the same Fedora release, is named again,
+# so that Renovate's Fedora PR moves it here too.
+
+# FROM the runtime's image (the flatpak stage of runtime/Containerfile), the
+# named context runtime (build/docker-bake.hcl), which a build without it
+# fails to pull, as the apps' do.
+FROM runtime AS flatpak
+
+# The runtime's packages stay as they are, at the versions the runtime's
+# image was built with (its weekly rebuild brings Fedora's updates to both).
+# Without weak dependencies, a line for each group, as the RUN lists them:
+# - C and C++ (also rustc's and cgo's linker), OpenSSL's headers and command;
+# - CMake, Ninja and Meson, the autotools with libtool, bison, flex, gettext;
+# - gdb and strace, for the app's devel feature (ptrace);
+# - git with LFS, the OpenSSH client (the session's agent, ssh-auth), less;
+# - the shell's tools that scripts and tools/test.sh expect (ps, file, ...);
+# - a terminal's own: clear, reset, tput, infocmp, tic, hostname, zip, script;
+# - Perl with shasum; python, pip and the headers pip builds C against;
+# - sqlite3, cpio, bsdtar, wget, nano: what scripts and READMEs call;
+# - NSS and libxkbfile, which VS Code links and the runtime lacks (ldd).
+# Not here, though Flathub's Sdk had them, with their cost on top of these
+# (dnf's, download / installed, Fedora 44, November 2026): valgrind, 4 / 29
+# MiB; ccache, 1 / 2 MiB; every library's headers and tools.
+# rpm installs their English files only: the runtime's image keeps the
+# base image's %_install_langs (runtime/Containerfile). Then, from the same
+# metadata (-C), the record of every security advisory dnf knew for the
+# runtime's packages and these, which the scan before the push goes by, as
+# for the runtime. Last, the runtime's rules again for what the packages
+# added: no file in ld.so.conf.d (flatpak's ld.so.conf would leave it out)
+# and ld.so.conf still empty, so that flatpak writes its own; no systemd
+# units, no build-id links, no /var. The metadata first, retried, as for
+# the runtime.
+RUN for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done \
+    && dnf -y --setopt=install_weak_deps=False install \
+        gcc gcc-c++ make pkgconf-pkg-config openssl-devel openssl \
+        cmake ninja-build meson autoconf automake libtool bison flex gettext \
+        gdb strace \
+        git-core git-lfs openssh-clients less \
+        jq which file procps-ng patch unzip \
+        ncurses hostname zip util-linux-script \
+        perl-interpreter perl-Digest-SHA python-unversioned-command python3-pip python3-devel \
+        sqlite cpio bsdtar wget2-wget nano \
+        nss libxkbfile \
+    && dnf -q -C advisory list --security --all --repo=updates --json \
+        > /usr/share/fedora-bootc/advisories-at-build.json \
+    && dnf clean all \
+    && test -z "$(ls -A /etc/ld.so.conf.d)" && test -f /etc/ld.so.conf && test ! -s /etc/ld.so.conf \
+    && ldconfig \
+    && rm -rf /usr/lib/systemd/system /usr/lib/systemd/user /usr/lib/systemd/*-preset \
+        /usr/lib/.build-id /var
+
+# --- what the image does not say: the flatpak.* labels ----------------------
+# The SDK's ID; its branch, the runtime's (the Fedora release). The rest,
+# the environment and the GL extension point, is the runtime's labels.
+LABEL flatpak.id=io.github.lucarickli.Sdk \
+      flatpak.branch=44
+
+# --- the test: an app of its own on the SDK, FROM scratch so that none of
+# the labels above apply to it, whose command is test.sh. flatpak.sh test
+# runs it in its sandbox, on the SDK as every app sees it -------------------
+FROM scratch AS test
+COPY --chmod=0755 test.sh /app/bin/sdk-test
+LABEL flatpak.id=io.github.lucarickli.Sdk.Test \
+      flatpak.runtime=io.github.lucarickli.Sdk//44 \
+      flatpak.command=sdk-test
+
+# ptrace, for gdb and strace, as the VS Code app has it: flatpak's seccomp
+# filter refuses it to an app without the devel feature.
+LABEL flatpak.finish-args.devel=--allow=devel

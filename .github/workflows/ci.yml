@@ -1,0 +1,353 @@
+# The pull request gate. Every PR runs this one workflow, and its last job,
+# `ci-ok`, is the one status check that matters: the main branch ruleset
+# (.github/rulesets/main.json) requires it, so nothing merges (Renovate's
+# automerge included) until it is green. devcontainer.yml and flatpaks.yml
+# only matter for some paths, and a required check from a path-filtered
+# workflow never reports on the PRs it skips, and blocks them forever.
+# `ci-ok` exists on every PR and reports only after everything it depends on
+# has finished: skipped (not affected by this PR) counts as passed, failed
+# or cancelled does not.
+#
+# What a PR gets: lint always; the dev container, and the runtime and the
+# SDK with their apps (the VS Code Flatpak on the SDK), built and tested,
+# when the PR can affect them; and the pins against upstream's signatures
+# when one changes. Nothing is pushed or signed.
+#
+# On a push to main only lint runs, and only when CI plumbing (.github/,
+# build/), the Justfile or verify-pins.sh changed (devcontainer.yml and
+# flatpaks.yml run themselves on push). Every Monday before their weekly builds, and by
+# hand, lint and the pins: a release file replaced upstream together with
+# the checksum file install.sh checks it against passes install.sh, not
+# the pin check (tools/verify-pins.sh), and notify.yml opens the issue.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "build/**"
+      - "Justfile"
+      - "tools/verify-pins.sh"
+  schedule:
+    # 07:17 UTC, two hours before devcontainer.yml's and flatpaks.yml's
+    # weekly builds, off the top of the hour, when GitHub delays or drops
+    # scheduled runs
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+# A PR's runs supersede each other, as do pushes to a branch; the weekly
+# run and one by hand are a group of their own, which a push does not
+# cancel.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || format('{0}-{1}', github.ref, github.event_name) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Which of the expensive workflows this PR can affect. This workflow
+  # itself counts as everything, so a change to the wiring runs all of it.
+  changes:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      devcontainer: ${{ steps.classify.outputs.devcontainer }}
+      flatpaks: ${{ steps.classify.outputs.flatpaks }}
+      renovate: ${{ steps.classify.outputs.renovate }}
+      pins: ${{ steps.classify.outputs.pins }}
+    steps:
+      - name: Classify the changed files
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          CHANGED: ${{ github.event.pull_request.changed_files }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case $EVENT in
+            push)
+              # The other workflows run on push by themselves; here only lint.
+              printf '%s\n' devcontainer=false flatpaks=false renovate=true pins=false | tee -a "$GITHUB_OUTPUT"
+              exit 0 ;;
+            schedule | workflow_dispatch)
+              # The weekly check of every pin, before the weekly builds.
+              printf '%s\n' devcontainer=false flatpaks=false renovate=false pins=true | tee -a "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
+          # Both names of a rename. Three tries, 30 s apart: the API fails
+          # with a 5xx at times.
+          for attempt in 1 2 3; do
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" \
+              --jq '.[] | .filename, (.previous_filename // empty)' > files.txt && break
+            [ "$attempt" != 3 ] || exit 1
+            echo "the PR's files: attempt $attempt failed, retrying in 30s" >&2
+            sleep 30
+          done
+          echo "changed files:"; sed 's/^/  /' files.txt
+
+          devcontainer=false flatpaks=false renovate=false pins=false
+          while IFS= read -r f; do
+            case "$f" in
+              .github/workflows/ci.yml)
+                devcontainer=true; flatpaks=true; renovate=true; pins=true ;;
+              # used by every build: the runner, buildx, and the scan (its
+              # rules also drive the VS Code Flatpak's secret scan). Signing
+              # runs on push only; install-tools, for lint alone, and the
+              # Justfile, which no build runs, are lint's (always).
+              .github/actions/prepare-runner/*|.github/actions/buildx/*|.github/actions/scan-image/*)
+                devcontainer=true; flatpaks=true ;;
+              # the index's script, which no build runs (pages.yml, on main)
+              build/index.sh) ;;
+              # what builds them all: the bake file, build.sh, the builder,
+              # flatpak.sh, and the scripts both workflows run (ci.sh, its
+              # cache and plan; private.sh)
+              build/*)
+                devcontainer=true; flatpaks=true ;;
+              # tools/ and keys/, the build contexts tools and keys of every
+              # build in both: what the dev container and the VS Code Flatpak
+              # (flatpaks.yml) install, test and carry, all of tools/ but the
+              # pin check, and the keys they check downloads with.
+              tools/verify-pins.sh) ;;
+              tools/*|keys/*)
+                devcontainer=true; flatpaks=true ;;
+              # the dev container's own files, its build context
+              devcontainer/*|.github/workflows/devcontainer.yml)
+                devcontainer=true ;;
+              # the runtime, the SDK and every app, the VS Code Flatpak
+              # included: flatpaks.yml's plan runs the jobs of those this
+              # PR can affect (build/ci.sh)
+              runtime/*|apps/*|.github/workflows/flatpaks.yml|.github/workflows/flatpak.yml)
+                flatpaks=true ;;
+            esac
+            case "$f" in
+              .github/renovate.json) renovate=true ;;
+            esac
+            # The pins, and how they are checked against upstream.
+            case "$f" in
+              tools/tools.txt|tools/extensions.txt|tools/verify-pins.sh) pins=true ;;
+            esac
+          done < files.txt
+          # The files API stops at 3000 files. Anything that big runs
+          # everything rather than trusting a truncated list.
+          if [ "${CHANGED:-0}" -ge 3000 ]; then
+            echo "::notice::${CHANGED} changed files, more than the API lists: running everything"
+            devcontainer=true flatpaks=true renovate=true pins=true
+          fi
+          {
+            echo "devcontainer=$devcontainer"
+            echo "flatpaks=$flatpaks"
+            echo "renovate=$renovate"
+            echo "pins=$pins"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # Cheap, and on every PR: the workflow files themselves (actionlint runs
+  # shellcheck on every `run:` block, zizmor audits them for supply-chain
+  # and permission mistakes), the syntax of every shell script (`just
+  # check`), and the Renovate config when it changed.
+  lint:
+    needs: changes
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      # renovate: datasource=github-releases depName=zizmorcore/zizmor
+      ZIZMOR_VERSION: "v1.30.1"
+      # renovate: datasource=npm depName=renovate
+      RENOVATE_VERSION: "44.164.6"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # actionlint and the shellcheck it runs on every `run:` block are
+      # tools.txt's, as in the dev container: GitHub's releases, checked by
+      # their sha256 (install.sh) and against GitHub's attestations
+      # (verify-pins.sh), with no Docker Hub pull, whose anonymous rate
+      # limit GitHub's runners share.
+      - name: Install just, gh, actionlint and shellcheck
+        uses: ./.github/actions/install-tools
+        with:
+          tools: just gh actionlint shellcheck
+
+      # .github/actionlint.yaml, from the checkout's root
+      - name: actionlint
+        run: actionlint -color
+
+      # The release binary, run only once GitHub's build provenance shows it
+      # came from zizmor's release workflow at that tag. With the job's
+      # token (read-only) it also runs its online audits, such as an action
+      # pinned to a commit that is not in the action's repository, or a
+      # known-vulnerable action. The findings that are by design are in
+      # .github/zizmor.yml and inline.
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/zizmor"
+          tarball="${dir}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$dir"
+          curl -fsSL --retry 5 --retry-all-errors -o "$tarball" \
+            "https://github.com/zizmorcore/zizmor/releases/download/${ZIZMOR_VERSION}/${tarball##*/}"
+          # GitHub's attestation API fails with a 503 at times.
+          for attempt in 1 2 3; do
+            gh attestation verify "$tarball" --repo zizmorcore/zizmor \
+              --signer-workflow zizmorcore/zizmor/.github/workflows/release-binaries.yml \
+              --source-ref "refs/tags/${ZIZMOR_VERSION}" --deny-self-hosted-runners && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 10
+          done
+          tar -xzf "$tarball" -C "$dir"
+          "${dir}/zizmor" --no-progress --format=github .github/
+
+      - name: Syntax
+        run: just check
+
+      # The dev container's Claude Code pin is the VS Code Flatpak's (its
+      # Containerfile's CLAUDE_VERSION). devcontainer.yml tests that too, but
+      # runs only when the dev container is affected.
+      - name: Claude Code pins agree
+        run: |
+          pin=$(sed -n 's/^ARG CLAUDE_VERSION=//p' devcontainer/Containerfile)
+          test -n "$pin" && test "$pin" = "$(sed -n 's/^ARG CLAUDE_VERSION=//p' apps/io.github.lucarickli.Code/Containerfile)"
+
+      # Renovate needs a current Node (44.x: 24 or newer).
+      - name: Node for Renovate
+        if: needs.changes.outputs.renovate == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      # Installed first, three tries 30 s apart: the release ci.yml pins
+      # (RENOVATE_VERSION, which Renovate bumps), from npm, with no lockfile
+      # of its own, hence the zizmor ignore. No file argument: with one, the
+      # validator treats it as a GLOBAL (self-hosted) config. Without, it
+      # finds .github/renovate.json and checks it as the repository config
+      # it is.
+      - name: Renovate config
+        if: needs.changes.outputs.renovate == 'true'
+        run: | # zizmor: ignore[adhoc-packages]
+          prefix="${RUNNER_TEMP}/renovate"
+          for attempt in 1 2 3; do
+            npm install --silent --no-audit --no-fund --prefix "$prefix" "renovate@${RENOVATE_VERSION}" && break
+            [ "$attempt" != 3 ] || exit 1
+            echo "npm install failed (attempt $attempt), retrying in 30s" >&2
+            sleep 30
+          done
+          "$prefix/node_modules/.bin/renovate-config-validator" --strict
+
+  # The pins (tools/tools.txt, tools/extensions.txt) against what upstream
+  # signs or attests at that version, beyond the sha256 install.sh checks
+  # (tools/verify-pins.sh has what and why): on a PR that changes one, and
+  # every Monday. No secrets: the token only reads public releases and
+  # attestations.
+  pins:
+    name: pins
+    needs: changes
+    if: needs.changes.outputs.pins == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # renovate: datasource=go depName=aead.dev/minisign
+      MINISIGN_VERSION: "v0.3.0"
+      # renovate: datasource=go depName=github.com/slsa-framework/slsa-verifier/v2
+      SLSA_VERIFIER_VERSION: "v2.7.1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The verifiers come pinned and checked as well. gh and Go are the base
+      # branch's pins (install.sh, sha256), which this job checked when they
+      # were merged: a pull request that bumps gh or Go is checked with the
+      # ones it replaces, not by themselves.
+      - name: Checkout the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # main itself on the weekly run and one by hand
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: base
+          persist-credentials: false
+
+      # cosign-installer checks the release it installs.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
+
+      # minisign and slsa-verifier built from their modules with that Go,
+      # which checks them against sum.golang.org.
+      - name: Install gh, Go, minisign and slsa-verifier
+        run: |
+          set -euo pipefail
+          prefix="${RUNNER_TEMP}/verifiers"
+          base/tools/install.sh "$prefix" gh go
+          export GOTOOLCHAIN=local GOFLAGS=-modcacherw GOPATH="${RUNNER_TEMP}/gopath" GOBIN="${prefix}/bin"
+          # three tries, 30 s apart: the module proxy, as any download
+          for pkg in "aead.dev/minisign/cmd/minisign@${MINISIGN_VERSION}" \
+                     "github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@${SLSA_VERIFIER_VERSION}"; do
+            for attempt in 1 2 3; do
+              "${prefix}/go/bin/go" install "$pkg" && break
+              [ "$attempt" != 3 ] || exit 1
+              echo "go install $pkg failed (attempt $attempt), retrying in 30s" >&2
+              sleep 30
+            done
+          done
+
+      - name: Check the pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: PATH="${RUNNER_TEMP}/verifiers/bin:${PATH}" tools/verify-pins.sh
+
+  devcontainer:
+    needs: changes
+    if: needs.changes.outputs.devcontainer == 'true'
+    uses: ./.github/workflows/devcontainer.yml
+    # What devcontainer.yml's jobs ask for. On a pull request nothing is
+    # pushed or uploaded; fork PRs get a read-only token whatever is granted
+    # here.
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+  flatpaks:
+    needs: changes
+    if: needs.changes.outputs.flatpaks == 'true'
+    uses: ./.github/workflows/flatpaks.yml
+    # What flatpaks.yml's jobs ask for: a called job, nested ones too, cannot
+    # have more than its caller grants. actions: read for the plan, write
+    # for each pipeline's index job, which starts pages.yml on main only (on
+    # a pull request no job here gets it).
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+      security-events: write
+
+  ci-ok:
+    needs: [changes, lint, pins, devcontainer, flatpaks]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Everything that ran passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' >/dev/null

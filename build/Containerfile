@@ -1,0 +1,13 @@
+# localhost/packages/builder (the builder target of docker-bake.hcl), which
+# build.sh makes and tests every Flatpak in, with flatpak.sh: flatpak (and
+# the python3 it needs, which makes the test's stand-in Docker socket),
+# dbus-daemon for the session bus `flatpak run` wants (dbus-run-session),
+# jq and tar, which read an image's archive and its files, util-linux for
+# setpriv and setsid, and an ordinary user for the test, tester. Never
+# published. Build context: this directory.
+FROM registry.fedoraproject.org/fedora:44
+RUN for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done \
+    && dnf -y install --setopt=install_weak_deps=False flatpak dbus-daemon jq tar util-linux \
+    && dnf clean all && rm -rf /var/cache/dnf /var/cache/libdnf5 \
+    && useradd -m tester
+COPY --chmod=0755 flatpak.sh /usr/local/bin/flatpak.sh

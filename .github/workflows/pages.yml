@@ -1,0 +1,92 @@
+# The Flatpak remote, a static site on GitHub Pages, of what ghcr.io has
+# now: build/index.sh reads each Flatpak's published image (`build/build.sh
+# names`), its digest and its labels, and writes the index flatpak asks an
+# oci+https remote for, one root for every Flatpak's latest
+# (https://<owner>.github.io/<repository>/) and one for each variant (ai/,
+# the VS Code Flatpak with Claude Code), each with its .flatpakrepo, and an
+# index.html. Only metadata: the images stay private, and a machine pulls
+# them with a token of its own. A Flatpak not published yet is left out
+# (index.sh), so none holds back the others.
+#
+# Started by each Flatpak's pipeline once it pushed (flatpak.yml's index
+# job), by hand (again, without a build), and when its script changes. On
+# main only, as Pages takes no other branch (the github-pages environment).
+# One at a time, the index and its deployment together, so that an older
+# index never replaces a newer one; one still pending when another queues
+# gives way to it, which reads the registry later. Pages' source must be
+# GitHub Actions (the repository's settings, Pages).
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/index.sh"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The site, as the artifact deploy takes.
+  index:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read   # the checkout
+      packages: read   # each Flatpak's image: its manifest, its labels
+      pages: read      # configure-pages: the site's URL
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Flatpaks are the bake file's (build.sh names, bake --print),
+      # which needs no builder.
+      - name: Set up buildx
+        uses: ./.github/actions/buildx
+        with:
+          buildkit: "false"
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          set -euo pipefail
+          build/build.sh names > "${RUNNER_TEMP}/names"
+          build/index.sh "${RUNNER_TEMP}/site" "$URL" < "${RUNNER_TEMP}/names"
+
+      - name: Upload
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    needs: index
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      pages: write      # the deployment
+      id-token: write   # its OIDC token, by which Pages checks the branch
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,0 +1,914 @@
+#!/usr/bin/python3 -I
+"""Pywalfox native-messaging host of this Firefox flatpak, fed by Noctalia v5.
+
+Noctalia, the host's shell, is the Pywalfox host of a Firefox outside a sandbox
+(`noctalia firefox-theme host`, src/theme/firefox_theme/ in Noctalia 5.4). Its
+`pywalfox` template writes $XDG_CACHE_HOME/wal/colors.json; its `firefox-theme`
+post-action keeps the theme mode in $XDG_CONFIG_HOME/pywalfox/config.json and
+announces both in $XDG_RUNTIME_DIR/noctalia/firefox-theme/command. This sandboxed
+Firefox cannot start the host's noctalia binary, so this program is the host
+inside the sandbox. It answers the extension as Noctalia's host does and follows
+the same three files, which the app's labels grant read-only (flatpak also mounts the
+first two over the app's own $XDG_CACHE_HOME/wal and $XDG_CONFIG_HOME/pywalfox):
+
+- colors.json: sent when the extension asks, and whenever the file changes;
+- config.json: its theme mode sent with the first colors, and whenever the file
+  changes (Noctalia writes it before each command, so the mode arrives even when
+  its command file was replaced again before this host read it);
+- the command file: action:update and theme:mode:{dark,light,auto}.
+
+Custom CSS (userChrome.css, userContent.css: copies of Noctalia's) goes into the
+chrome folder of the profile that started this host. /app/libexec/firefox-prestart
+installs the manifest that makes Firefox start this program.
+"""
+
+import ctypes
+import json
+import os
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+# The Pywalfox extension reads the version with parseFloat() and asks for an
+# update below 2.7. Noctalia answers "noctalia-2.9.0-compat".
+VERSION = "2.9.0-noctalia-flatpak"
+EXTENSION_ID = "pywalfox@frewacom.org"
+DESCRIPTION = "Noctalia Firefox theme native messaging host (Flatpak)"
+SHARE = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, "share", "pywalfox"))
+MANIFEST_TEMPLATE = os.path.join(SHARE, "pywalfox.json")
+CSS_ASSETS = os.path.join(SHARE, "css")
+CSS_TARGETS = ("userChrome", "userContent")
+
+MAX_MESSAGE = 1024 * 1024  # largest message accepted from the extension (Noctalia's limit)
+MAX_FILE = 1024 * 1024  # Firefox drops a host whose message exceeds 1 MiB
+POLL_INTERVAL = 1.0  # seconds, when inotify is not available (or PYWALFOX_NO_INOTIFY=1)
+SETTLE = 0.05  # seconds for a burst of writes (colors.json, config.json, the command file twice) to land
+
+MODES = ("dark", "light", "auto")
+CMD_UPDATE = "action:update"
+CMD_MODE_PREFIX = "theme:mode:"
+
+USAGE = """\
+usage: pywalfox COMMAND
+
+The Pywalfox native-messaging host of this Firefox flatpak, fed by Noctalia v5.
+Noctalia's own CLI drives it from the host: noctalia firefox-theme update|dark|light|auto.
+
+  start        run as the host (what Firefox starts, with MANIFEST EXTENSION-ID)
+  install      install ~/.mozilla/native-messaging-hosts/pywalfox.json (Firefox's
+               launcher does on every start); --force replaces another host's
+  uninstall    remove that manifest if it is this host's; --force: any
+  self-test    check the protocol against scratch homes
+  version      print the version
+"""
+
+
+def log(message):
+    print("pywalfox: " + message, file=sys.stderr, flush=True)
+
+
+# --- Paths: Noctalia's -------------------------------------------------------------
+
+
+def home():
+    return os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def xdg_dir(variable, fallback):
+    return os.environ.get(variable) or os.path.join(home(), fallback)
+
+
+def colors_path():
+    return os.path.join(xdg_dir("XDG_CACHE_HOME", ".cache"), "wal", "colors.json")
+
+
+def settings_path():
+    return os.path.join(xdg_dir("XDG_CONFIG_HOME", ".config"), "pywalfox", "config.json")
+
+
+def command_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        directory = os.path.join(runtime, "noctalia", "firefox-theme")
+    else:
+        directory = os.path.join(tempfile.gettempdir(), "noctalia-firefox-theme-%d" % os.getuid())
+    return os.path.join(directory, "command")
+
+
+def manifest_path():
+    # Firefox's user manifests are in ~/.mozilla, also with its XDG profile layout;
+    # in the sandbox that is the app's persistent .mozilla.
+    return os.path.join(home(), ".mozilla", "native-messaging-hosts", "pywalfox.json")
+
+
+def read_small(path):
+    """The file's bytes, None when missing or unreadable, or ValueError when larger
+    than MAX_FILE."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(MAX_FILE + 1)
+    except OSError:
+        return None
+    if len(data) > MAX_FILE:
+        raise ValueError("%s is larger than %d bytes" % (path, MAX_FILE))
+    return data
+
+
+def write_atomic(path, data):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# --- What Noctalia writes ------------------------------------------------------------
+
+
+def settings():
+    """config.json (the extension's settings file, which Noctalia keeps)."""
+    try:
+        data = json.loads(read_small(settings_path()) or b"{}")
+    except (ValueError, RecursionError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def saved_mode():
+    mode = settings().get("theme_mode")
+    return mode if mode in MODES else None
+
+
+def read_command():
+    try:
+        data = read_small(command_path())
+    except ValueError:
+        return None
+    lines = (data or b"").decode("utf-8", "replace").splitlines()
+    return lines[0].strip() if lines else None
+
+
+def load_colors(path):
+    """(data, None) or (None, error), with Noctalia's rules and messages."""
+    try:
+        raw = read_small(path)
+    except ValueError as e:
+        return None, str(e)
+    if raw is None:
+        return None, "Could not read colors from: " + path
+    try:
+        root = json.loads(raw)
+    except (ValueError, RecursionError) as e:
+        return None, "Failed to read colors: %s" % e
+    if not isinstance(root, dict) or not isinstance(root.get("colors"), dict):
+        return None, path + " does not contain any color values"
+    if not isinstance(root.get("wallpaper"), str):
+        return None, path + " does not contain a wallpaper path"
+    table = root["colors"]
+    colors = [table["color%d" % i] for i in range(16) if isinstance(table.get("color%d" % i), str)]
+    if len(colors) < 16:
+        # Noctalia's fallback: every string value, in key order.
+        colors = [table[key] for key in sorted(table) if isinstance(table[key], str)]
+    if len(colors) < 16:
+        return None, path + " containing the generated Pywal colors is invalid"
+    return {"colors": colors, "wallpaper": root["wallpaper"]}, None
+
+
+# --- Custom CSS --------------------------------------------------------------------------
+
+
+def parse_ini(path):
+    sections = {}
+    section = None
+    data = read_small(path)
+    if data is None:
+        raise FileNotFoundError(path)
+    for line in data.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line or line[0] in ";#":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = sections.setdefault(line[1:-1], {})
+        elif section is not None and "=" in line:
+            key, value = line.split("=", 1)
+            section[key.strip()] = value.strip()
+    return sections
+
+
+def profile_dir(root, section):
+    path = section.get("Path", "")
+    if not path:
+        return None
+    return os.path.join(root, path) if section.get("IsRelative", "1") == "1" else path
+
+
+def profiles_roots():
+    override = settings().get("profile_path")
+    if isinstance(override, str) and override:
+        yield override
+    # Firefox keeps its legacy layout while it exists, else uses its XDG one.
+    yield os.path.join(home(), ".mozilla", "firefox")
+    yield os.path.join(xdg_dir("XDG_CONFIG_HOME", ".config"), "mozilla", "firefox")
+
+
+def parent_profile():
+    """The profile of the Firefox that started this host: the directory of the
+    .parentlock it keeps open (None when its fds cannot be read)."""
+    fds = "/proc/%d/fd" % os.getppid()
+    try:
+        names = os.listdir(fds)
+    except OSError:
+        return None
+    for name in names:
+        try:
+            target = os.readlink(os.path.join(fds, name))
+        except OSError:
+            continue
+        if target.endswith("/.parentlock") and os.path.isdir(os.path.dirname(target)):
+            return os.path.dirname(target)
+    return None
+
+
+def runs_parent(profile):
+    """Whether the profile's lock (a symlink to "<ip>:+<pid>") names our parent's
+    pid. Every `flatpak run` has its own pid namespace with Firefox as pid 2, so
+    this only decides when one profile matches."""
+    try:
+        target = os.readlink(os.path.join(profile, "lock"))
+    except OSError:
+        return False
+    return target.rpartition(":")[2].lstrip("+") == str(os.getppid())
+
+
+def make_chrome(profile):
+    chrome = os.path.join(profile, "chrome")
+    try:
+        os.makedirs(chrome, exist_ok=True)
+    except OSError as e:
+        return None, "Could not create chrome folder: %s" % e
+    return chrome, None
+
+
+def chrome_dir():
+    """(path, None) or (None, error): the chrome folder of the profile of the
+    Firefox that started us, else of the default profile (Noctalia's choice)."""
+    profile = parent_profile()
+    if profile:
+        return make_chrome(profile)
+    for root in profiles_roots():
+        ini = os.path.join(root, "profiles.ini")
+        try:
+            sections = parse_ini(ini)
+        except (OSError, ValueError):
+            continue
+        profiles = [profile_dir(root, s) for name, s in sections.items() if name.startswith("Profile")]
+        profiles = [p for p in profiles if p and os.path.isdir(p)]
+        running = [p for p in profiles if runs_parent(p)]
+        chosen = running[0] if len(running) == 1 else None
+        if chosen is None:
+            defaults = [os.path.join(root, s["Default"]) for name, s in sections.items()
+                        if name.startswith("Install") and s.get("Default")]
+            defaults += [profile_dir(root, s) for name, s in sections.items()
+                         if name.startswith("Profile") and s.get("Default") == "1"]
+            defaults.append(profile_dir(root, sections.get("Profile0", {})))
+            chosen = next((p for p in defaults if p and os.path.isdir(p)), None)
+        if chosen is None:
+            return None, "Could not find a profile in " + ini
+        return make_chrome(chosen)
+    return None, "Could not find Firefox profiles folder"
+
+
+def css_name(target):
+    name = target[:-4] if target.endswith(".css") else target
+    return name + ".css" if name in CSS_TARGETS else None
+
+
+def css_action(action, filename, size, chrome):
+    """(success, text) of css:enable, css:disable and css:font:size."""
+    path = os.path.join(chrome, filename)
+    if action == "css:enable":
+        try:
+            with open(os.path.join(CSS_ASSETS, filename), "rb") as f:
+                write_atomic(path, f.read())
+        except OSError as e:
+            return False, "Could not copy custom CSS to folder: %s" % e
+        return True, "Custom CSS: %s has been enabled" % filename
+    if action == "css:disable":
+        try:
+            if os.path.isfile(path):
+                os.unlink(path)
+        except OSError as e:
+            return False, "Could not remove custom CSS: %s" % e
+        return True, "Custom CSS: %s has been disabled" % filename
+    try:
+        data = read_small(path)
+    except ValueError:
+        data = None
+    if data is None:
+        return False, "Could not set font size: file not found"
+    # Bytes and "\n" only, as Noctalia's getline: a file in another encoding or
+    # with other line breaks keeps them.
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    lines = [b"  --pywalfox-font-size: %dpx;" % size if b"--pywalfox-font-size:" in line else line
+             for line in lines]
+    try:
+        write_atomic(path, b"\n".join(lines) + b"\n")
+    except OSError:
+        return False, "Could not set font size: write failed"
+    return True, "Font size was set to: %d" % size
+
+
+# --- The host ---------------------------------------------------------------------------
+
+
+def send(message):
+    # ASCII: a lone surrogate from a \ud800 escape in a file still encodes.
+    body = json.dumps(message, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(struct.pack("<I", len(body)) + body)
+    sys.stdout.buffer.flush()
+
+
+class Reader:
+    """Length-prefixed JSON messages from the extension on stdin."""
+
+    def __init__(self):
+        self.buffer = b""
+        self.eof = False
+
+    def feed(self):
+        try:
+            chunk = os.read(0, 65536)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            chunk = b""
+        if chunk:
+            self.buffer += chunk
+        else:
+            self.eof = True
+
+    def messages(self):
+        while len(self.buffer) >= 4:
+            (length,) = struct.unpack("<I", self.buffer[:4])
+            if length > MAX_MESSAGE:
+                self.eof = True
+                return
+            if len(self.buffer) < 4 + length:
+                return
+            body, self.buffer = self.buffer[4:4 + length], self.buffer[4 + length:]
+            try:
+                yield json.loads(body)
+            except (ValueError, RecursionError):
+                yield {"action": "action:invalid"}
+
+
+class Inotify:
+    """inotify through libc (the runtime's Python has no binding)."""
+
+    MASK = 0x8 | 0x80 | 0x100  # IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE
+    OVERFLOW = 0x4000  # IN_Q_OVERFLOW
+
+    def __init__(self):
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        self.dirs = {}
+
+    def watch(self, directory):
+        wd = self.libc.inotify_add_watch(self.fd, os.fsencode(directory), self.MASK)
+        if wd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_add_watch " + directory)
+        self.dirs[wd] = directory
+
+    def changed(self):
+        """The paths of every pending event; None after a queue overflow (anything
+        may have changed)."""
+        out = set()
+        while True:
+            try:
+                data = os.read(self.fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                return out
+            offset = 0
+            while offset + 16 <= len(data):
+                wd, mask, _cookie, length = struct.unpack_from("iIII", data, offset)
+                name = data[offset + 16:offset + 16 + length].split(b"\0", 1)[0]
+                offset += 16 + length
+                if mask & self.OVERFLOW:
+                    out = None
+                elif out is not None and wd in self.dirs:
+                    out.add(os.path.join(self.dirs[wd], os.fsdecode(name)))
+
+
+def signature(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+class Host:
+    def __init__(self):
+        self.colors = colors_path()
+        self.settings = settings_path()
+        self.command = command_path()
+        self.watched = (self.colors, self.settings, self.command)
+        self.saved_mode_sent = False
+
+    def send_colors(self):
+        data, error = load_colors(self.colors)
+        if data is None:
+            send({"action": "action:colors", "success": False, "error": error})
+        else:
+            send({"action": "action:colors", "success": True, "data": data})
+
+    def send_mode(self, mode):
+        send({"action": "theme:mode", "success": True, "data": mode})
+
+    def on_message(self, message):
+        action = message.get("action") if isinstance(message, dict) else None
+        if action == "debug:version":
+            send({"action": action, "success": True, "data": VERSION})
+        elif action == "action:colors":
+            self.send_colors()
+            if not self.saved_mode_sent:
+                self.saved_mode_sent = True
+                mode = saved_mode()
+                if mode:
+                    self.send_mode(mode)
+        elif action in ("css:enable", "css:disable", "css:font:size"):
+            self.on_css(action, message)
+        else:
+            send({"action": "action:invalid", "success": False})
+
+    def on_css(self, action, message):
+        target = message.get("target")
+        if not isinstance(target, str) or not target:
+            send({"action": "action:invalid", "success": False})
+            return
+        size = None
+        if action == "css:font:size":
+            size = message.get("size")
+            if isinstance(size, str):
+                try:
+                    size = int(size)
+                except ValueError:
+                    size = None
+            if isinstance(size, bool) or not isinstance(size, int):
+                send({"action": "action:invalid", "success": False})
+                return
+        reply = {"action": action, "data": size if action == "css:font:size" else target}
+        filename = css_name(target)
+        chrome, error = chrome_dir() if filename else (None, "Unsupported custom CSS target: " + target)
+        ok, text = (False, error) if chrome is None else css_action(action, filename, size, chrome)
+        reply["success"] = ok
+        reply["message" if ok else "error"] = text
+        send(reply)
+
+    def on_changes(self, changed):
+        """Noctalia's post-action writes config.json, then the command file twice
+        (theme:mode:<mode>, action:update); by the time the file is read only the
+        second may be left, but config.json holds the mode."""
+        mode = None
+        colors = self.colors in changed
+        if self.settings in changed:
+            mode = saved_mode()
+        if self.command in changed:
+            command = read_command() or ""
+            if command == CMD_UPDATE:
+                colors = True
+            elif command.startswith(CMD_MODE_PREFIX) and command[len(CMD_MODE_PREFIX):] in MODES:
+                mode = command[len(CMD_MODE_PREFIX):]
+        if mode:
+            self.send_mode(mode)
+        if colors:
+            self.send_colors()
+
+    def watch(self):
+        """Inotify on the directories of the three files, or None (then poll)."""
+        if os.environ.get("PYWALFOX_NO_INOTIFY") == "1":
+            return None
+        try:
+            inotify = Inotify()
+        except (OSError, AttributeError) as e:
+            log("inotify unavailable (%s), polling every %gs" % (e, POLL_INTERVAL))
+            return None
+        for path in self.watched:
+            directory = os.path.dirname(path)
+            try:
+                os.makedirs(directory, exist_ok=True)
+                inotify.watch(directory)
+            except OSError as e:
+                # Not granted, or missing on the host when Firefox started: that
+                # file's changes are not followed until Firefox restarts.
+                log("not following %s: %s" % (path, e))
+        return inotify
+
+    def run(self):
+        inotify = self.watch()
+        poller = select.poll()
+        poller.register(0, select.POLLIN)
+        if inotify:
+            poller.register(inotify.fd, select.POLLIN)
+        seen = {path: signature(path) for path in self.watched}
+        reader = Reader()
+        while True:
+            try:
+                ready = poller.poll(None if inotify else POLL_INTERVAL * 1000)
+            except InterruptedError:
+                continue
+            changed = set()
+            for fd, event in ready:
+                if fd == 0:
+                    if event & select.POLLIN:
+                        reader.feed()
+                    elif event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                        reader.eof = True
+                    for message in reader.messages():
+                        self.guarded(self.on_message, message)
+                    if reader.eof:
+                        return 0
+                else:
+                    time.sleep(SETTLE)
+                    paths = inotify.changed()
+                    changed |= set(self.watched) if paths is None else paths
+            if not inotify:
+                for path in self.watched:
+                    now = signature(path)
+                    if now != seen[path] and now is not None:
+                        changed.add(path)
+                    seen[path] = now
+            if changed:
+                self.guarded(self.on_changes, changed)
+
+    @staticmethod
+    def guarded(handler, argument):
+        """One bad message or file must not end the host (Firefox would not
+        start it again until the extension reconnects)."""
+        try:
+            handler(argument)
+        except (BrokenPipeError, KeyboardInterrupt):
+            raise
+        except Exception as e:  # noqa: BLE001
+            log("%s: %s: %s" % (handler.__name__, type(e).__name__, e))
+
+
+def run_host():
+    try:
+        return Host().run()
+    except (BrokenPipeError, KeyboardInterrupt):
+        # Firefox went away: keep the interpreter's final flush quiet.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+        return 0
+
+
+# --- The manifest ------------------------------------------------------------------------
+
+
+def is_ours(path):
+    try:
+        return json.loads(read_small(path) or b"{}").get("description") == DESCRIPTION
+    except (ValueError, RecursionError, AttributeError):
+        return False
+
+
+def install(force):
+    with open(MANIFEST_TEMPLATE, "rb") as f:
+        template = f.read()
+    path = manifest_path()
+    try:
+        current = read_small(path)
+    except ValueError:
+        current = None
+    if current == template:
+        print("Up to date: " + path)
+        return 0
+    if os.path.lexists(path) and not force and not is_ours(path):
+        log("leaving another host's manifest at %s (--force replaces it)" % path)
+        return 1
+    if os.path.islink(path):
+        os.unlink(path)
+    write_atomic(path, template)
+    print("Installed " + path + "\nRestart Firefox if it is running.")
+    return 0
+
+
+def uninstall(force):
+    path = manifest_path()
+    if not os.path.lexists(path):
+        return 0
+    if not force and not is_ours(path):
+        log("%s belongs to another host (--force removes it)" % path)
+        return 1
+    os.unlink(path)
+    print("Removed " + path)
+    return 0
+
+
+# --- Self-test ----------------------------------------------------------------------------
+
+
+def self_test():
+    """Run the host as Firefox does, against scratch homes, with inotify and with
+    polling, writing what Noctalia writes, and check every exchange; then the
+    manifest commands. Exit status 0 when all pass."""
+    scratch = tempfile.mkdtemp(prefix="pywalfox-self-test-")
+    try:
+        for poll in (False, True):
+            SelfTest(scratch, poll).run()
+        _self_test_manifest(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("pywalfox self-test: ok")
+    return 0
+
+
+def _scratch_env(scratch, name):
+    root = os.path.join(scratch, name)
+    env = dict(os.environ, HOME=os.path.join(root, "home"), XDG_CACHE_HOME=os.path.join(root, "cache"),
+               XDG_CONFIG_HOME=os.path.join(root, "config"), XDG_RUNTIME_DIR=os.path.join(root, "run"))
+    env.pop("PYWALFOX_NO_INOTIFY", None)
+    for key in ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"):
+        os.makedirs(env[key])
+    return env
+
+
+class SelfTest:
+    def __init__(self, scratch, poll):
+        self.what = "polling" if poll else "inotify"
+        self.scratch = scratch
+        self.env = _scratch_env(scratch, self.what)
+        if poll:
+            self.env["PYWALFOX_NO_INOTIFY"] = "1"
+        self.wait = 5 * POLL_INTERVAL if poll else 3.0
+        self.me = os.path.realpath(__file__)
+        self.host = None
+
+    def path(self, variable, *parts):
+        return os.path.join(self.env[variable], *parts)
+
+    def check(self, condition, message):
+        if not condition:
+            if self.host:
+                self.host.kill()
+            raise SystemExit("pywalfox self-test (%s) failed: %s" % (self.what, message))
+
+    # What Noctalia writes.
+    def write_colors(self, first):
+        colors = {"color%d" % i: "#%06x" % (i * 0x0f0f0f) for i in range(16)}
+        colors["color0"] = first
+        body = {"wallpaper": "/wallpaper.png", "alpha": "100", "colors": colors}
+        write_atomic(self.path("XDG_CACHE_HOME", "wal", "colors.json"), json.dumps(body).encode())
+
+    def write_mode(self, mode):
+        # In place, as Noctalia's settings::set.
+        path = self.path("XDG_CONFIG_HOME", "pywalfox", "config.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"theme_mode": mode}, indent=2) + "\n")
+
+    def write_command(self, command):
+        write_atomic(self.path("XDG_RUNTIME_DIR", "noctalia", "firefox-theme", "command"), command.encode())
+
+    # The extension's side of the port.
+    def request(self, message):
+        body = message if isinstance(message, bytes) else json.dumps(message).encode()
+        self.host.stdin.write(struct.pack("<I", len(body)) + body)
+        self.host.stdin.flush()
+
+    def read_exact(self, count, deadline):
+        data = b""
+        fd = self.host.stdout.fileno()
+        while len(data) < count:
+            left = deadline - time.monotonic()
+            self.check(left > 0 and select.select([fd], [], [], left)[0], "no reply in time")
+            chunk = os.read(fd, count - len(data))
+            self.check(chunk, "the host exited")
+            data += chunk
+        return data
+
+    def reply(self):
+        deadline = time.monotonic() + self.wait
+        (length,) = struct.unpack("<I", self.read_exact(4, deadline))
+        return json.loads(self.read_exact(length, deadline))
+
+    def replies_until(self, done, what):
+        """Replies until `done` accepts the list of them (at most 6): a burst may
+        arrive in one batch or several."""
+        got = []
+        while not done(got):
+            self.check(len(got) < 6, "%s: %r" % (what, got))
+            got.append(self.reply())
+        return got
+
+    def quiet(self):
+        """Wait until nothing more arrives (a burst may send a reply twice)."""
+        fd = self.host.stdout.fileno()
+        while select.select([fd], [], [], 0.5 if self.what == "inotify" else 1.5 * POLL_INTERVAL)[0]:
+            self.reply()
+
+    def run(self):
+        def is_colors(m, first=None):
+            return (m.get("action") == "action:colors" and m.get("success")
+                    and (first is None or m["data"]["colors"][0] == first))
+
+        def mode(m):
+            return {"action": "theme:mode", "success": True, "data": m}
+
+        self.write_colors("#000001")
+        self.write_mode("dark")
+        profiles = self.path("XDG_CONFIG_HOME", "mozilla", "firefox")
+        for profile in ("a.default-release", "b.other"):
+            os.makedirs(os.path.join(profiles, profile))
+        write_atomic(os.path.join(profiles, "profiles.ini"), (
+            "[Profile1]\nName=other\nIsRelative=1\nPath=b.other\n\n"
+            "[Profile0]\nName=default-release\nIsRelative=1\nPath=a.default-release\n\n"
+            "[Install0123456789ABCDEF]\nDefault=a.default-release\nLocked=1\n").encode())
+
+        # As Firefox starts it: the manifest's path, the manifest and the extension id.
+        self.host = subprocess.Popen([self.me, self.path("HOME", "pywalfox.json"), EXTENSION_ID], env=self.env,
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+        self.request({"action": "debug:version"})
+        self.check(self.reply() == {"action": "debug:version", "success": True, "data": VERSION}, "version")
+        self.request({"action": "action:colors"})
+        got = self.reply()
+        self.check(is_colors(got, "#000001") and got["data"]["wallpaper"] == "/wallpaper.png"
+                   and len(got["data"]["colors"]) == 16, "colors: %r" % got)
+        self.check(self.reply() == mode("dark"), "the saved mode after the first colors")
+        self.request({"action": "action:colors"})
+        self.check(is_colors(self.reply(), "#000001"), "colors again")
+        self.quiet()  # the saved mode goes with the first colors only
+
+        self.write_colors("#000002")  # the template: colors.json alone
+        self.check(is_colors(self.reply(), "#000002"), "colors.json changed")
+        self.quiet()
+        self.write_mode("light")  # `noctalia firefox-theme light` writes config.json ...
+        self.write_command("theme:mode:light")  # ... then the command
+        self.check(self.reply() == mode("light"), "config.json and theme:mode:light")
+        self.quiet()
+        self.write_command("action:update")  # `noctalia firefox-theme update`
+        self.check(is_colors(self.reply(), "#000002"), "action:update")
+        self.quiet()
+        self.write_command("theme:mode:dark")  # the command alone
+        self.check(self.reply() == mode("dark"), "theme:mode:dark")
+        self.quiet()
+
+        # Noctalia's post-action burst: colors.json, config.json, then both commands.
+        self.write_colors("#000003")
+        self.write_mode("auto")
+        self.write_command("theme:mode:auto")
+        self.write_command("action:update")
+        self.replies_until(lambda got: mode("auto") in got and any(is_colors(m, "#000003") for m in got),
+                           "post-action: the new mode and the new colors")
+        self.quiet()
+
+        chrome = os.path.join(profiles, "a.default-release", "chrome")
+        self.request({"action": "css:enable", "target": "userChrome"})
+        got = self.reply()
+        self.check(got == {"action": "css:enable", "success": True, "data": "userChrome",
+                           "message": "Custom CSS: userChrome.css has been enabled"}, "css:enable: %r" % got)
+        with open(os.path.join(CSS_ASSETS, "userChrome.css"), "rb") as a, \
+                open(os.path.join(chrome, "userChrome.css"), "rb") as b:
+            self.check(a.read() == b.read(), "userChrome.css copied into the default profile")
+        self.request({"action": "css:font:size", "target": "userChrome", "size": "15"})
+        got = self.reply()
+        self.check(got.get("success") and got.get("data") == 15, "css:font:size: %r" % got)
+        with open(os.path.join(chrome, "userChrome.css"), encoding="utf-8") as f:
+            self.check("\n  --pywalfox-font-size: 15px;\n" in f.read(), "font size written")
+        self.request({"action": "css:disable", "target": "userChrome.css"})
+        got = self.reply()
+        self.check(got.get("success") and not os.path.exists(os.path.join(chrome, "userChrome.css")),
+                   "css:disable: %r" % got)
+
+        # A file in another encoding keeps its bytes when the font size changes.
+        with open(os.path.join(chrome, "userChrome.css"), "wb") as f:
+            f.write(b"/* caf\xe9 */\r\n:root {\n  --pywalfox-font-size: 13px;\n}\n")
+        self.request({"action": "css:font:size", "target": "userChrome", "size": 11})
+        self.check(self.reply().get("success"), "css:font:size on a Latin-1 file")
+        with open(os.path.join(chrome, "userChrome.css"), "rb") as f:
+            self.check(f.read() == b"/* caf\xe9 */\r\n:root {\n  --pywalfox-font-size: 11px;\n}\n",
+                       "css:font:size changed more than the size")
+
+        def css_lands_in(profile, what):
+            target = os.path.join(profiles, profile, "chrome", "userContent.css")
+            if os.path.exists(target):
+                os.unlink(target)
+            self.request({"action": "css:enable", "target": "userContent"})
+            self.check(self.reply().get("success") and os.path.isfile(target), what)
+
+        # The Firefox that started the host: the lock naming its pid (here: this
+        # process's), unless two profiles' locks name it (separate flatpak
+        # instances, all pid 2), and above all the .parentlock it holds open.
+        os.symlink("127.0.0.1:+%d" % os.getpid(), os.path.join(profiles, "b.other", "lock"))
+        css_lands_in("b.other", "the profile whose lock names the host's parent")
+        os.symlink("127.0.0.1:+%d" % os.getpid(), os.path.join(profiles, "a.default-release", "lock"))
+        css_lands_in("a.default-release", "two locks name the parent: the default profile")
+        with open(os.path.join(profiles, "b.other", ".parentlock"), "w"):
+            css_lands_in("b.other", "the profile whose .parentlock the parent holds open")
+
+        for bad, expected in ((
+                {"action": "css:enable", "target": "../../escape"}, {"action": "css:enable", "success": False}),
+                ({"action": "css:font:size", "target": "userContent"}, {"action": "action:invalid"}),
+                ({"action": "css:enable"}, {"action": "action:invalid", "success": False}),
+                ({"action": "nonsense"}, {"action": "action:invalid", "success": False}),
+                (["not", "an", "object"], {"action": "action:invalid", "success": False}),
+                (b"{not json", {"action": "action:invalid", "success": False})):
+            self.request(bad)
+            got = self.reply()
+            self.check(all(got.get(k) == v for k, v in expected.items()), "%r -> %r" % (bad, got))
+        self.check(not any(name.startswith("escape") for _, _, names in os.walk(self.scratch) for name in names),
+                   "a CSS target outside the chrome folder was written")
+
+        # A missing colors.json is an error reply, not a crash.
+        os.unlink(self.path("XDG_CACHE_HOME", "wal", "colors.json"))
+        self.request({"action": "action:colors"})
+        got = self.reply()
+        self.check(got.get("action") == "action:colors" and got.get("success") is False
+                   and "Could not read colors" in got.get("error", ""), "missing colors.json: %r" % got)
+
+        # Firefox closing the port ends the host.
+        self.host.stdin.close()
+        try:
+            self.check(self.host.wait(5) == 0, "exit status %s at the end of input" % self.host.returncode)
+        except subprocess.TimeoutExpired:
+            self.check(False, "still running at the end of input")
+        self.host.stdout.close()
+
+
+def _self_test_manifest(scratch):
+    env = _scratch_env(scratch, "manifest")
+    me = os.path.realpath(__file__)
+    manifest = os.path.join(env["HOME"], ".mozilla", "native-messaging-hosts", "pywalfox.json")
+
+    def run(*args):
+        return subprocess.run([me] + list(args), env=env, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode
+
+    def content():
+        with open(manifest, "rb") as f:
+            return f.read()
+
+    def check(condition, message):
+        if not condition:
+            raise SystemExit("pywalfox self-test (manifest) failed: " + message)
+
+    with open(MANIFEST_TEMPLATE, "rb") as f:
+        template = f.read()
+    check(json.loads(template) == {"name": "pywalfox", "description": DESCRIPTION, "path": "/app/bin/pywalfox",
+                                   "type": "stdio", "allowed_extensions": [EXTENSION_ID]},
+          "template %s" % MANIFEST_TEMPLATE)
+    check(run("install") == 0 and content() == template, "install")
+    write_atomic(manifest, b'{"name": "pywalfox", "description": "another host", "path": "/x", "type": "stdio"}')
+    check(run("install") != 0 and run("uninstall") != 0 and b"another host" in content(),
+          "another host's manifest was not left alone")
+    check(run("install", "--force") == 0 and content() == template, "install --force")
+    check(run("uninstall") == 0 and not os.path.lexists(manifest), "uninstall")
+
+
+# --- Command line ---------------------------------------------------------------------------
+
+
+def main(argv):
+    # Firefox starts the host with the manifest's path and the extension id.
+    if EXTENSION_ID in argv[1:3]:
+        return run_host()
+    command = argv[1] if len(argv) > 1 else "help"
+    force = "--force" in argv[2:]
+    if command in ("start", "host"):
+        return run_host()
+    if command == "install":
+        return install(force)
+    if command == "uninstall":
+        return uninstall(force)
+    if command == "self-test":
+        return self_test()
+    if command in ("version", "--version", "-v"):
+        print(VERSION)
+        return 0
+    if command in ("help", "--help", "-h"):
+        print(USAGE, end="")
+        return 0
+    print(USAGE, end="", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,247 @@
+# Build the shared runtime (runtime/), the SDK on it (runtime/sdk/) and the
+# apps on them (apps/*/ with a Containerfile), and push them to
+# ghcr.io/<owner>/<flatpak ID, lowercase> as OCI images, private packages
+# all (build/private.sh refuses a public one): :latest and :<yyyymmdd>,
+# signed with the cosign key (`cosign verify --key keys/cosign.pub`;
+# flatpak itself checks only GPG). The VS Code Flatpak goes to
+# ghcr.io/<owner>/code: plain as :latest and :<yyyymmdd>, ai (with Claude
+# Code) as :ai and :<yyyymmdd>-ai, one ref, io.github.lucarickli.Code//stable,
+# which a machine takes plain or ai by the index root it adds
+# (apps/io.github.lucarickli.Code/README.md). The index, the Flatpak remote
+# on GitHub Pages, is pages.yml's.
+#
+# Each Flatpak (`build/build.sh names`, of the bake file) is a pipeline of
+# its own, flatpak.yml: build, test, scan and push, then its own sign and a
+# new index, so that one that fails or is slow holds back no other's
+# release. The plan (build/ci.sh plan) picks them: on a push to main, each
+# Flatpak whose sources changed since the last run on main that published
+# it, and each whose last pipeline failed; weekly, everything, the runtime
+# and the SDK pushed for Fedora's updates (the runtime and the builder
+# built again without the cache, FRESH); by hand, everything, as fresh.
+# The apps start right after the plan, but where this run rebuilds their
+# runtime (or the SDK): then once its pipeline is done, as they build on
+# its cache and, on main, test on the Flatpak it pushed. Every image is
+# baked on the registry cache, ghcr.io/<owner>/packages-cache, which every
+# job reads and only a run on main writes (build/ci.sh bake). Pull requests
+# get this through ci.yml, the PR gate, with the Flatpaks the PR can
+# affect, built, tested and scanned only, as does a run by hand on a branch
+# other than main.
+name: flatpaks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "runtime/**"
+      - "apps/**"
+      # the VS Code Flatpak's tools, extensions and Claude Code's key
+      - "tools/**"
+      - "!tools/verify-pins.sh"
+      - "!tools/test.sh"
+      - "keys/claude-code.asc"
+      # the bake file, the builder, flatpak.sh and the scripts the jobs
+      # run, not the index's (pages.yml)
+      - "build/**"
+      - "!build/index.sh"
+      - ".github/workflows/flatpaks.yml"
+      - ".github/workflows/flatpak.yml"
+  schedule:
+    # 09:23 UTC, off the top of the hour, when GitHub delays or drops
+    # scheduled runs
+    - cron: "23 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      security:
+        description: "Fedora security updates this rebuild is for, as ADVISORY SEVERITY PACKAGES separated by ';': the runtime and the SDK must contain them, or the build fails"
+        required: false
+        type: string
+  workflow_call:
+    secrets:
+      SIGNING_SECRET:
+        required: false
+
+# Only pull requests supersede each other. Any other run waits for the one
+# before it (never cancelled while it pushes or signs); one that is still
+# pending when a newer one queues is dropped, and leaves its changes to
+# that one (the plan goes by the runs that published, not by the pushes).
+concurrency:
+  group: flatpaks-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Which Flatpaks this run builds and which it pushes, and the date of all
+  # its tags, also when a job runs past midnight. A failed query plans
+  # nothing, and so pushes nothing.
+  plan:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      actions: read     # the runs before, which published what (build/ci.sh)
+      contents: read
+    outputs:
+      day: ${{ steps.plan.outputs.day }}
+      runtime-build: ${{ steps.plan.outputs.runtime-build }}
+      runtime-push: ${{ steps.plan.outputs.runtime-push }}
+      runtime-ready: ${{ steps.plan.outputs.runtime-ready }}
+      sdk-build: ${{ steps.plan.outputs.sdk-build }}
+      sdk-push: ${{ steps.plan.outputs.sdk-push }}
+      sdk-ready: ${{ steps.plan.outputs.sdk-ready }}
+      apps: ${{ steps.plan.outputs.apps }}
+      sdk-apps: ${{ steps.plan.outputs.sdk-apps }}
+    steps:
+      # The whole history, for what changed since the last run that
+      # published each one.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The Flatpaks are the bake file's (build.sh names, bake --print),
+      # which needs no builder.
+      - name: Set up buildx
+        uses: ./.github/actions/buildx
+        with:
+          buildkit: "false"
+
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: build/ci.sh plan
+
+  # The runtime: its cache, written on main, is what every pipeline on it
+  # builds it of again. Weekly and by hand without the cache (FRESH), with
+  # the builder, for Fedora's updates. About 10 minutes on the runner's 4
+  # cores with the scan and the push (podman, November 2026), 2.4 GB at the
+  # peak.
+  runtime:
+    name: runtime
+    needs: plan
+    if: needs.plan.outputs.runtime-build == 'true'
+    uses: ./.github/workflows/flatpak.yml
+    permissions:
+      actions: write           # index: pages.yml
+      contents: read
+      packages: write          # the cache, the push, the signatures
+      security-events: write   # the scan's results
+    secrets:
+      SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+    with:
+      name: runtime
+      push: ${{ needs.plan.outputs.runtime-push == 'true' }}
+      day: ${{ needs.plan.outputs.day }}
+      scan: full
+      fresh: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+      disk: "15"
+      timeout: 30
+      security: ${{ inputs.security }}
+
+  # The SDK, on the runtime: after the runtime's pipeline where this run
+  # rebuilds the runtime (its cache), else at once. Its own cache is what
+  # the VS Code Flatpak's pipelines build it of again. 104 s on 24 cores,
+  # 3.7 GB; about 12 minutes on the runner.
+  sdk:
+    name: sdk
+    needs: [plan, runtime]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.sdk-build == 'true' &&
+      (needs.plan.outputs.runtime-build != 'true' || needs.runtime.outputs.built == 'true')
+    uses: ./.github/workflows/flatpak.yml
+    permissions:
+      actions: write           # index: pages.yml
+      contents: read
+      packages: write          # the cache, the push, the signatures
+      security-events: write   # the scan's results
+    secrets:
+      SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+    with:
+      name: sdk
+      push: ${{ needs.plan.outputs.sdk-push == 'true' }}
+      day: ${{ needs.plan.outputs.day }}
+      scan: full
+      disk: "20"
+      timeout: 40
+      security: ${{ inputs.security }}
+
+  # Each app on the runtime, a pipeline of its own, at once where this run
+  # does not rebuild the runtime. Up to 80 s each on 24 cores (Firefox;
+  # Remmina compiles), 3.5 GB; about 10 minutes on the runner, a few more
+  # on a pull request that changes the runtime, whose Flatpak each makes and
+  # tests too (nothing writes a pull request's cache).
+  apps:
+    name: ${{ matrix.name }}
+    needs: [plan, runtime]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.apps != '[]' &&
+      (needs.plan.outputs.runtime-build != 'true' || needs.runtime.outputs.built == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.apps) }}
+    uses: ./.github/workflows/flatpak.yml
+    permissions:
+      actions: write     # index: pages.yml
+      contents: read
+      packages: write    # the cache, the runtime's Flatpak, the push, the signatures
+      security-events: write   # flatpak.yml's build job asks for it (no scan here)
+    secrets:
+      SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+    with:
+      name: ${{ matrix.name }}
+      push: ${{ matrix.push }}
+      day: ${{ needs.plan.outputs.day }}
+      disk: "20"
+      timeout: 40
+      base-result: ${{ needs.runtime.result }}
+      base-ready: ${{ needs.plan.outputs.runtime-ready }}
+      base-push: ${{ needs.plan.outputs.runtime-push }}
+      base-build: ${{ needs.plan.outputs.runtime-build }}
+      base-digest: ${{ needs.runtime.outputs.digest }}
+
+  # Each app on the SDK, the VS Code Flatpak's two variants: after the
+  # SDK's pipeline where this run rebuilds the SDK, else at once (not after
+  # the runtime's). Upstream's releases throughout (VS Code, Claude Code,
+  # the tools) in /app alone, which get the secret scan. VS Code's tree is
+  # 4 GB, made into a Flatpak twice, the app and its test, side by side:
+  # 524 s on 24 cores as a pull request's job, about 35 minutes on the
+  # runner, some 30 GB of disk with BuildKit's copy of the SDK and the
+  # scan's of the image; more than twice that before a hung test is stopped.
+  sdk-apps:
+    name: ${{ matrix.name }}
+    needs: [plan, sdk]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.sdk-apps != '[]' &&
+      (needs.plan.outputs.sdk-build != 'true' || needs.sdk.outputs.built == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.sdk-apps) }}
+    uses: ./.github/workflows/flatpak.yml
+    permissions:
+      actions: write           # index: pages.yml
+      contents: read
+      packages: write          # the cache, the SDK's Flatpak, the push, the signatures
+      security-events: write   # the scan's results
+    secrets:
+      SIGNING_SECRET: ${{ secrets.SIGNING_SECRET }}
+    with:
+      name: ${{ matrix.name }}
+      push: ${{ matrix.push }}
+      day: ${{ needs.plan.outputs.day }}
+      scan: secrets
+      disk: "40"
+      timeout: 90
+      base-result: ${{ needs.sdk.result }}
+      base-ready: ${{ needs.plan.outputs.sdk-ready }}
+      base-push: ${{ needs.plan.outputs.sdk-push }}
+      base-build: ${{ needs.plan.outputs.sdk-build }}
+      base-digest: ${{ needs.sdk.outputs.digest }}

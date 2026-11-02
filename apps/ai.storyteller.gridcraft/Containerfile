@@ -1,0 +1,134 @@
+# ai.storyteller.gridcraft: GridCraft, ArtCraft's spreadsheet
+# (github.com/storytold/gridcraft, MIT or Apache-2.0), upstream's own build:
+# the linux-x86_64 tarball of its GitHub release, which upstream's own
+# Flatpak repackages as it is (packaging/linux/flatpak/
+# ai.storyteller.gridcraft.bundle.yml), on io.github.lucarickli.Platform,
+# the runtime in runtime/. The tarball is /app: bin/ the app and
+# gridcraft-cli, its command line and MCP server; share/ its desktop file,
+# icons, metainfo and MIME package, named for the app's ID, and the
+# licences. What differs from upstream's Flatpak is the runtime, Fedora's
+# packages for Flathub's Freedesktop runtime, and with it lp, lpstat and
+# lpoptions: the runtime's cups-client, where upstream builds CUPS' into
+# /app (the printing permissions, below). The labels of the flatpak stage
+# have the permissions, the test stage the test (test.sh). The four Craft
+# apps (apps/ai.storyteller.*) are one Containerfile each, line for line
+# the same but for the app and its permissions.
+
+# The runtime's image, the flatpak stage of runtime/Containerfile, is the
+# named context runtime (build/docker-bake.hcl), which the build stage is
+# FROM. The runtime's branch is named once here, in flatpak.runtime below,
+# one place fewer for a Fedora bump, and a build without the context fails
+# at once.
+
+# --- build: on the runtime's image, so that the checks below run against
+# the libraries GridCraft will run with; only /app leaves it -----------------
+FROM runtime AS build
+
+# The release's tarball, checked against its line in the release's
+# SHA256SUMS.txt, which names the tarball with its version: exactly one
+# line. That is all upstream publishes to check it by, no signature and no
+# attestation (GitHub has none for it), and SHA256SUMS.txt is a file of
+# the same release: this catches a broken download, not a replaced
+# release. Unpacked as upstream's Flatpak installs it: all of it, but for
+# its top directory (gridcraft-<version>-linux-x86_64).
+# renovate: datasource=github-releases depName=storytold/gridcraft extractVersion=^v(?<version>.+)$
+ARG GRIDCRAFT_VERSION=0.14.2
+RUN set -eux; \
+    for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done; \
+    dnf -y --setopt=install_weak_deps=False install desktop-file-utils; \
+    base=https://github.com/storytold/gridcraft/releases/download/v$GRIDCRAFT_VERSION; \
+    tarball=gridcraft-$GRIDCRAFT_VERSION-linux-x86_64.tar.gz; \
+    work=$(mktemp -d); cd "$work"; \
+    for f in SHA256SUMS.txt "$tarball"; do \
+        curl -fsSL --retry 5 --retry-all-errors -o "$f" "$base/$f"; \
+    done; \
+    awk -v a="$tarball" '$2 == a && $1 ~ /^[0-9a-f]{64}$/' SHA256SUMS.txt > sums; \
+    test "$(wc -l < sums)" = 1; \
+    sha256sum -c sums; \
+    mkdir /app; \
+    tar -xzf "$tarball" -C /app --strip-components=1 --no-same-owner; \
+    cd /; rm -rf "$work"
+
+# The app as it will run: GridCraft and gridcraft-cli start, and are this
+# version; every library they link is the runtime's, and so is every one
+# GridCraft loads by name when it starts, which ldd does not see and which
+# are most of them (winit's Wayland, X11 and xkbcommon, the renderer's EGL,
+# GL or Vulkan, D-Bus): each soname the binaries name, loaded as dlopen
+# loads it. lp, lpstat and lpoptions, which it runs to print, are the
+# runtime's; the desktop file is valid. The test checks them in the sandbox
+# again.
+RUN set -eux; \
+    for bin in gridcraft gridcraft-cli; do \
+        set -- $("/app/bin/$bin" --version); test "$2" = "$GRIDCRAFT_VERSION"; \
+    done; \
+    test -z "$(ldd /app/bin/gridcraft /app/bin/gridcraft-cli | grep 'not found' || :)"; \
+    python3 -c 'import ctypes, sys; [ctypes.CDLL(n) for n in sys.argv[1:]]' \
+        $(grep -aohE 'lib[A-Za-z0-9_+-]+\.so\.[0-9]+' /app/bin/gridcraft /app/bin/gridcraft-cli | sort -u); \
+    for tool in lp lpstat lpoptions; do command -v "$tool"; done; \
+    desktop-file-validate /app/share/applications/ai.storyteller.gridcraft.desktop
+
+# --- the app: /app, nothing else, and the flatpak.* labels ------------------
+# FROM scratch, so that none of the runtime image's labels (its ID, its
+# environment, its GL extension point) carry over into the app's.
+FROM scratch AS flatpak
+COPY --from=build /app /app
+
+# The app's ID, upstream's (its Flatpak's, and the name of its desktop
+# file, icons, metainfo and MIME package); the runtime it runs on, whose
+# branch is Fedora's release (runtime/Containerfile); the command, the app
+# (gridcraft-cli is beside it: flatpak run --command=gridcraft-cli).
+LABEL flatpak.id=ai.storyteller.gridcraft \
+      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.command=gridcraft
+
+# The permissions of upstream's Flatpak, the finish-args of its manifests
+# (the bundle's and the from-source one, the same), one group for each of
+# upstream's reasons.
+#
+# The display: Wayland, and X11 only where there is no Wayland, with X11's
+# shared memory (ipc), without which the X11 fallback is slow or fails.
+LABEL flatpak.finish-args.display="--socket=wayland --socket=fallback-x11 --share=ipc"
+
+# The GPU, for the wgpu renderer (and its GL fallback).
+LABEL flatpak.finish-args.gpu=--device=dri
+
+# Printing: lpstat, lp and lpoptions (craft-print runs them) reach the
+# host's CUPS through its socket, which flatpak mounts as
+# /var/run/cups/cups.sock, where the runtime's libcups finds it
+# (/run/cups/cups.sock: /var/run is /run in the sandbox), and find
+# driverless network printers through Avahi (lpstat -e); without them the
+# Print dialog lists no printers. The user's CUPS settings, read-only: the
+# default printer and saved options (lpoptions), and a print server their
+# client.conf names, which lp reaches over the network. A client.conf that
+# names another socket (ServerName /path), which flatpak mounts in the same
+# place, the runtime's lp misses (it dials that path); upstream's own lp
+# has a wrapper for it.
+LABEL flatpak.finish-args.printing="\
+    --socket=cups \
+    --system-talk-name=org.freedesktop.Avahi \
+    --filesystem=~/.cups:ro"
+
+# Files: Open and Save go through the file chooser portal, drag and drop
+# through the document portal, so a file picked works wherever it is;
+# Documents and Downloads for a workbook given by its path (the command
+# line).
+LABEL flatpak.finish-args.files="--filesystem=xdg-documents --filesystem=xdg-download"
+
+# The network: the update check asks GitHub for the latest release (a copy
+# from a repository never updates itself, craft-update leaves it to the
+# repository).
+LABEL flatpak.finish-args.network=--share=network
+
+# The ArtCraft Launcher's ArtCraft/versions/versions.json in the host's
+# data dir, read-only: the version the launcher keeps each Craft app on, so
+# that an app's own update check offers none it manages. Read by
+# craft-update since craft-libs 7d303b4, not yet by this release's
+# (04aa170); granted as upstream does, so the release that reads it needs
+# no change here.
+LABEL flatpak.finish-args.launcher=--filesystem=xdg-data/ArtCraft/versions:ro
+
+# --- the test: the app, its ID and its permissions, with test.sh as its
+# command, which flatpak.sh test runs in the installed app's sandbox ---------
+FROM flatpak AS test
+COPY --chmod=0755 test.sh /app/bin/gridcraft-test
+LABEL flatpak.command=gridcraft-test

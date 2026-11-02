@@ -1,0 +1,87 @@
+# Make a GitHub-hosted ubuntu-26.04 runner fit for the builds here: docker
+# buildx bake on a docker-container builder (build/build.sh), privileged
+# containers of docker's that make and test the Flatpaks, and rootless
+# podman for the scan and the dev container's tests. Every job that builds
+# uses it, right after actions/checkout (a local action only exists once
+# the repo is checked out).
+#
+# What differs from a workstation:
+#
+# - /tmp is a RAM-backed tmpfs on 26.04 (half the RAM, ~7.8 GB, and a user
+#   quota that fails writes at ~6.3 GB; actions/runner-images#14777). Masked
+#   and unmounted, which is the maintainers' own workaround, so /tmp is the
+#   root disk again.
+# - Ubuntu confines user namespaces with AppArmor. podman has a profile
+#   that allows them, but a sandbox inside a container (flatpak's, in the
+#   Flatpaks' build and test, runs bwrap) does not: the
+#   bwrap-userns-restrict profile strips the capabilities of whatever bwrap
+#   starts. The runner is a throwaway VM, so the restriction is lifted and
+#   bwrap's children stay in its own profile (the override bootc-dev/actions
+#   ships for 26.04, #55).
+# - Disk. Public-repo runners come with a ~145 GB root disk and ~90 GB free,
+#   but GitHub only promises 14 GB, so the preinstalled toolchains nobody
+#   here uses are removed when there is less than `cleanup-below` GB free,
+#   and the job stops right here, with a clear message, if there is still
+#   less than `need` GB. docker keeps its images and the builder's state
+#   (BuildKit's cache) in /var/lib/docker, rootless podman its storage in
+#   ~/.local/share/containers, the jobs their layouts in the checkout: all
+#   on that same root disk.
+name: Prepare the runner
+description: tmpfs /tmp off, user namespaces usable, enough free disk
+inputs:
+  need:
+    description: GB that must be free on / (fails the job otherwise)
+    default: "50"
+  cleanup-below:
+    description: remove unused preinstalled toolchains if fewer GB than this are free
+    default: "70"
+runs:
+  using: composite
+  steps:
+    - name: tmpfs /tmp, AppArmor, disk
+      shell: bash
+      env:
+        NEED: ${{ inputs.need }}
+        CLEANUP_BELOW: ${{ inputs.cleanup-below }}
+      run: |
+        set -euo pipefail
+        if findmnt -n -t tmpfs /tmp >/dev/null; then
+          sudo systemctl mask tmp.mount
+          sudo umount -l /tmp
+        fi
+
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        if sudo test -r /etc/apparmor.d/bwrap-userns-restrict &&
+           sudo grep -qx 'bwrap (enforce)' /sys/kernel/security/apparmor/profiles; then
+          printf '%s\n' 'priority=100 allow file rwlkm /**,' 'priority=100 allow ix /**,' |
+            sudo tee /etc/apparmor.d/local/bwrap-userns-restrict >/dev/null
+          sudo apparmor_parser -Q /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+        fi
+
+        free_gb() { df --output=avail -BG / | tail -1 | tr -dc '0-9'; }
+        before=$(free_gb)
+        if [ "$before" -lt "$CLEANUP_BELOW" ]; then
+          echo "::notice::${before} GB free, below ${CLEANUP_BELOW} GB: removing unused toolchains"
+          # None of this is used by any workflow here. The runner is
+          # discarded after the job, so nothing needs to be put back.
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /usr/share/swift /usr/local/share/boost /opt/microsoft \
+            /usr/local/julia* /usr/lib/jvm /usr/local/share/powershell /usr/local/share/chromium \
+            /swapfile /mnt/swapfile
+          # The tool cache is emptied, not removed: a setup-* action later
+          # in a job installs into it and cannot recreate it.
+          sudo find "${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          echo "freed $(( $(free_gb) - before )) GB"
+        fi
+        df -h / /tmp
+        if [ "$(free_gb)" -lt "$NEED" ]; then
+          echo "::error::only $(free_gb) GB free on /, this job needs ${NEED} GB"
+          exit 1
+        fi
+
+        docker version --format 'docker {{.Server.Version}}'
+        podman version --format 'podman {{.Client.Version}}'
+        podman info --format 'graphroot: {{.Store.GraphRoot}} ({{.Store.GraphDriverName}})'
+        skopeo --version

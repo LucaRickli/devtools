@@ -1,0 +1,16 @@
+#!/bin/sh
+# /app/bin/claude, in the ai variant: runs Claude Code (/app/libexec/claude),
+# Anthropic's release, which the image carries (the Containerfile's claude
+# stage).
+#
+#   claude [ARG...]
+#
+# Its updates are off, because the version is the app's. Its own updater
+# would put a newer one in ~/.local/bin. The app's environment turns them
+# off too, for the copy the VS Code extension runs. This script does it as
+# well, for `flatpak enter` and for an override of that environment.
+export DISABLE_UPDATES=1 DISABLE_INSTALLATION_CHECKS=1
+# The same CLAUDE_CONFIG_DIR as the launcher (code) sets, also for
+# `flatpak run --command=claude`. claude-sandboxed sets its own.
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$XDG_CONFIG_HOME/claude}"
+exec /app/libexec/claude "$@"

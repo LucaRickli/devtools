@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# /app/bin/code: starts VS Code with the tools from tools.txt on PATH. It
+# also writes a new profile's settings, and installs the extensions that a
+# first start needs.
+#
+#   code [ARG...]      the arguments of VS Code's own `code`
+set -e
+
+# --- Environment ---
+# PATH gets the places where `go install`, `cargo install` and
+# `deno install -g` put what they build, as the toolchains themselves are
+# read-only in /app. It also gets mise's shims, for what only mise installed
+# (node, say). The extensions and tasks need both.
+# ~/go, ~/.cargo and ~/.deno are the app's own, kept in its directory with
+# the module and crate caches (--persist, the Containerfile's labels).
+# They come after /app's tools, not before. In a checkout, a shim stops with
+# "not trusted" until `mise trust` (mise-config.toml), and the Go extension
+# would lose Go there. The terminal's fish switches versions per project
+# itself (mise activate).
+export PATH=$PATH:$HOME/go/bin:${CARGO_HOME:-$HOME/.cargo}/bin:$HOME/.deno/bin:${MISE_DATA_DIR:-$XDG_DATA_HOME/mise}/shims
+# sops would look for its age key in $XDG_CONFIG_HOME. flatpak points that
+# at this app's own directory, not at ~/.config where the key is. The key is
+# in here once an override grants ~/.config/sops/age (see README.md).
+export SOPS_AGE_KEY_FILE=${SOPS_AGE_KEY_FILE:-$HOME/.config/sops/age/keys.txt}
+# Temporary files go where the host sees them too: the app's directory in
+# XDG_RUNTIME_DIR, at the same path inside and out. (/tmp in here is the
+# app's own.) Dev Containers writes a Dockerfile there for the host's podman
+# to build. `code --wait` writes its marker there, so that every instance of
+# the app sees it. It is a tmpfs, emptied at logout.
+if [ -d "$XDG_RUNTIME_DIR/app/$FLATPAK_ID" ]; then
+    export TMPDIR="$XDG_RUNTIME_DIR/app/$FLATPAK_ID"
+fi
+# The ai variant is this app with Claude Code: /app/bin/claude and
+# claude-sandboxed, which the plain one lacks (the Containerfile's
+# flatpak-ai stage).
+ai=
+if [ -x /app/bin/claude ]; then ai=1; fi
+# Claude Code's login, settings and history are the app's own, because
+# ~/.claude is not in here. The terminal's claude and the VS Code extension
+# share one login. claude-sandboxed keeps another.
+if [ -n "$ai" ]; then
+    export CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$XDG_CONFIG_HOME/claude}
+fi
+
+# --- A new profile's settings ---
+# An existing settings.json is left alone. A new profile starts with:
+#   - Dev Containers on the host's podman. /app/bin/podman runs it through
+#     host-spawn, once host access is granted.
+#   - The Go extension using the gopls and tools in /app, instead of
+#     fetching its own. The dev container has the same settings.
+#   - Dev Containers not mounting the Wayland socket. It would hand each
+#     container the compositor's own socket, around the restricted one that
+#     flatpak gives the app.
+#   - Local History skipping /tmp and /run/user. There, sops and kubectl
+#     hand $EDITOR the decrypted or live text (TMPDIR above, and the
+#     document portal's files from the host).
+#   - In the ai variant, a terminal profile that runs claude-sandboxed.
+settings=$XDG_CONFIG_HOME/Code/User/settings.json
+if [ ! -e "$settings" ]; then
+    mkdir -p "${settings%/*}"
+    {
+        echo '{'
+        if [ -n "$ai" ]; then
+            cat <<'JSON'
+    "terminal.integrated.profiles.linux": {
+        "claude-sandboxed": { "path": "/app/bin/claude-sandboxed", "icon": "shield" }
+    },
+JSON
+        fi
+        cat <<'JSON'
+    "dev.containers.dockerPath": "podman",
+    "dev.containers.mountWaylandSocket": false,
+    "go.toolsManagement.checkForUpdates": "local",
+    "go.toolsManagement.autoUpdate": false,
+    "go.survey.prompt": false,
+    "files.watcherExclude": { "**/target/**": true },
+    "workbench.localHistory.exclude": { "/tmp/**": true, "/run/user/**": true }
+}
+JSON
+    } >"$settings"
+fi
+
+# --- Where sign-ins are stored ---
+# VS Code keeps sign-ins (GitHub, Settings Sync) and extensions' secrets in
+# a password store. Electron picks the store by desktop, and knows none of
+# this image's, so it is named here:
+#   - The login keyring, once an override grants the Secret Service
+#     (org.freedesktop.secrets) or the whole session bus
+#     (--socket=session-bus), which reaches it too. The Secret Service hands
+#     over every item in the keyring, not only VS Code's.
+#   - Otherwise the app's profile ("basic"), under a key built into
+#     Chromium. That is only as safe as the profile itself.
+# Switching between the two loses the stored sign-ins once.
+store=basic
+if grep -qxE 'org\.freedesktop\.secrets=(talk|own)' /.flatpak-info ||
+    grep -qE '^sockets=(.*;)?session-bus(;|$)' /.flatpak-info; then
+    store=gnome-libsecret
+fi
+
+# --- How VS Code runs ---
+# The same as VS Code's own bin/code, but through zypak, which gives
+# Chromium its sandbox inside flatpak's. The Containerfile builds zypak as
+# Flathub's Electron BaseApp does. VS Code is Microsoft's release, in
+# /app/lib/vscode.
+code=(env ELECTRON_RUN_AS_NODE=1 /app/bin/zypak-wrapper.sh /app/lib/vscode/code
+    /app/lib/vscode/resources/app/out/cli.js
+    --extensions-dir="$XDG_DATA_HOME/vscode/extensions" --password-store="$store")
+
+# --- Extensions ---
+# Each extension is installed into the profile once, and is yours from then
+# on. The Marketplace updates it, and one you remove stays removed.
+# extensions-offered records the ones installed so far.
+# The language extensions (extensions.txt), Dev Containers and, in the ai
+# variant, Claude Code come from the Marketplace by id. Only when that fails
+# (offline) do the language ones come from the copies in
+# /app/share/vscode/vsix, which VS Code keeps at their version until you
+# update them. Dev Containers and Claude Code's extension have no copy, as
+# they are not in extensions.txt. Offline, they are tried again on the next
+# start. The first start takes a few seconds longer.
+offered=$XDG_DATA_HOME/vscode/extensions-offered
+ids=(ms-vscode-remote.remote-containers) todo=()
+if [ -n "$ai" ]; then ids+=(anthropic.claude-code); fi
+for vsix in /app/share/vscode/vsix/*.vsix; do ids+=("$(basename "$vsix" .vsix)"); done
+for id in "${ids[@]}"; do
+    grep -qxF "$id" "$offered" 2>/dev/null || todo+=("$id")
+done
+# Nothing is installed when VS Code is called as an editor. $EDITOR is
+# code-wait, which runs `code --wait`. That only opens a file in the running
+# VS Code, and must not wait on the Marketplace each time.
+for arg; do case $arg in --wait | -w) todo=() ;; esac; done
+if [ ${#todo[@]} -gt 0 ]; then
+    args=()
+    for id in "${todo[@]}"; do args+=(--install-extension "$id"); done
+    "${code[@]}" "${args[@]}" >&2 || true
+    installed=$("${code[@]}" --list-extensions 2>/dev/null || true)
+    for id in "${todo[@]}"; do
+        vsix=/app/share/vscode/vsix/$id.vsix
+        if grep -qixF "$id" <<<"$installed" ||
+            { [ -e "$vsix" ] && "${code[@]}" --install-extension "$vsix" >&2; }; then
+            echo "$id" >>"$offered"
+        fi
+    done
+fi
+
+exec "${code[@]}" "$@"

@@ -1,0 +1,168 @@
+# org.mozilla.firefox: Mozilla's own release of Firefox, its linux-x86_64
+# en-US tarball, on io.github.lucarickli.Platform, the runtime in runtime/.
+# The app is /app alone: the tarball in /app/lib/firefox, and around it,
+# from files/ at the same paths, the launcher, the policies and default
+# prefs, the desktop file and the Pywalfox host that themes Firefox from the
+# host's Noctalia. The labels of the flatpak stage have the permissions, the
+# test stage the test (test.sh), README.md what differs from Flathub's
+# Firefox and why.
+
+# The runtime's image, the flatpak stage of runtime/Containerfile, is the
+# named context runtime (build/docker-bake.hcl), which the build stage is
+# FROM. The runtime's branch is named once here, in flatpak.runtime below,
+# one place fewer for a Fedora bump, and a build without the context fails
+# at once.
+
+# --- build: on the runtime's image, so that the checks below run against
+# the libraries Firefox will run with; only /app leaves it ------------------
+FROM runtime AS build
+
+# Mozilla's release: the tarball, checked against its line in the release's
+# SHA512SUMS, and that against its signature by Mozilla's release key. The
+# key comes from the release directory (KEY) and counts only as the primary
+# key and the signing subkey pinned here, as Mozilla's security blog gives
+# them,
+# https://blog.mozilla.org/security/2026/08/10/updated-gpg-key-for-signing-firefox-and-thunderbird-releases/
+# 14F2 6682 D091 6CDD 81E3 7B6D 61B7 B526 D98F 0353 and its subkey
+# 827E 6586 0867 9618 CD34 9F93 678E 455D 7676 7AA3 (until 2028-08-05).
+# The primary alone would not do: KEY has its expired subkeys too, and one
+# revoked as compromised (09BE ED63 F346 2A2D FFAB 3B87 5ECB 6497 C1A2
+# 0256), and gpg passes a signature by any of them (REVKEYSIG or EXPKEYSIG
+# for GOODSIG); a forged KEY could leave the revocation out anyway. Those
+# statuses fail the build as well, for the pinned subkey's own revocation or
+# expiry. So the next subkey fails the build until it is pinned here.
+# SHA512SUMS names the tarball with its version, so another release's,
+# signed as well, cannot stand in. The icons are the tarball's, as Mozilla's
+# Flatpak has them.
+# renovate: datasource=custom.firefox depName=firefox
+ARG FIREFOX_VERSION=159.0
+RUN set -eux; \
+    for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done; \
+    dnf -y --setopt=install_weak_deps=False install gnupg2 xz desktop-file-utils; \
+    key=14F26682D0916CDD81E37B6D61B7B526D98F0353; \
+    subkey=827E658608679618CD349F93678E455D76767AA3; \
+    base=https://archive.mozilla.org/pub/firefox/releases/$FIREFOX_VERSION; \
+    tarball=linux-x86_64/en-US/firefox-$FIREFOX_VERSION.tar.xz; \
+    work=$(mktemp -d); cd "$work"; \
+    for f in KEY SHA512SUMS SHA512SUMS.asc "$tarball"; do \
+        curl -fsSL --retry 5 --retry-all-errors --create-dirs -o "$f" "$base/$f"; \
+    done; \
+    export GNUPGHOME="$work/gnupg"; mkdir -m 700 "$GNUPGHOME"; \
+    gpg --batch --quiet --import KEY; \
+    gpg --batch --status-fd 3 --verify SHA512SUMS.asc SHA512SUMS 3>status; \
+    awk -v fpr="$key" -v subkey="$subkey" '$1 != "[GNUPG:]" { next } \
+        $2 == "VALIDSIG" && $3 == subkey && $NF == fpr { ok = 1 } \
+        $2 ~ /^(REVKEYSIG|EXPKEYSIG|EXPSIG)$/ { bad = 1 } \
+        END { exit !(ok && !bad) }' status; \
+    awk -v a="$tarball" '$2 == a && $1 ~ /^[0-9a-f]{128}$/' SHA512SUMS > sums; \
+    test "$(wc -l < sums)" = 1; \
+    sha512sum -c sums; \
+    mkdir -p /app/lib; \
+    tar -xJf "$tarball" -C /app/lib; \
+    test "$(sed -n 's/^Version=//p' /app/lib/firefox/application.ini)" = "$FIREFOX_VERSION"; \
+    for s in 16 32 48 64 128; do \
+        install -Dm644 "/app/lib/firefox/browser/chrome/icons/default/default$s.png" \
+            "/app/share/icons/hicolor/${s}x$s/apps/org.mozilla.firefox.png"; \
+    done; \
+    cd /; rm -rf "$work"
+
+COPY files/ /app/
+
+# The app as it will run: Firefox starts and is this version; every library
+# it links is its own (which it loads from its dir itself, hence ldd's
+# LD_LIBRARY_PATH) or the runtime's, as the sandbox has no other (the test
+# checks it there again); the launcher and helpers are executable, the
+# desktop file and the policies valid.
+RUN set -eux; \
+    test "$(/app/lib/firefox/firefox --version)" = "Mozilla Firefox $FIREFOX_VERSION"; \
+    missing=$(find /app/lib/firefox -type f \( -name '*.so' -o -perm -u+x \) \
+        -exec env LD_LIBRARY_PATH=/app/lib/firefox ldd {} + 2>/dev/null | grep 'not found' || :); \
+    test -z "$missing"; \
+    test -x /app/bin/firefox && test -x /app/bin/pywalfox && test -x /app/libexec/firefox-prestart; \
+    desktop-file-validate /app/share/applications/org.mozilla.firefox.desktop; \
+    python3 -m json.tool /app/lib/firefox/distribution/policies.json >/dev/null
+
+# --- the app: /app, nothing else, and the flatpak.* labels ------------------
+# FROM scratch, so that none of the runtime image's labels (its ID, its
+# environment, its GL extension point) carry over into the app's.
+FROM scratch AS flatpak
+COPY --from=build /app /app
+
+# The app's ID, Flathub's; the runtime it runs on, whose branch is Fedora's
+# release (runtime/Containerfile); the command, the launcher
+# (files/bin/firefox).
+LABEL flatpak.id=org.mozilla.firefox \
+      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.command=firefox
+
+# The permissions, one group for each reason. Flathub's, which Mozilla sets
+# in its own build of the Flatpak (repackage_flatpak in
+# python/mozbuild/mozbuild/repackaging/flatpak.py,
+# github.com/mozilla-firefox/firefox; the metadata of Flathub's commit
+# 829e35ba, 159.0, has the same), first. Left out, as this build has nothing
+# they serve: --socket=pcsc (smart cards, for the libpcsclite of Mozilla's
+# BaseApp), Kerberos' KCM socket (/run/.heim_org.h5l.kcm-socket, for the
+# BaseApp's krb5, whose credential cache is KCM:, where the runtime's is
+# Fedora's KEYRING:, the kernel keyring flatpak's seccomp filter shuts out of
+# every sandbox), and --require-version=0.11.1 (every flatpak since 2018).
+#
+# The GPU, cameras and FIDO keys (hidraw): every device; udev's database to
+# find them; ptrace for the crash reporter (devel).
+LABEL flatpak.finish-args.devices="--device=all --filesystem=/run/udev:ro --allow=devel"
+
+# The network, X11's shared memory (ipc), sound and the microphone
+# (pulseaudio), printing through the host's CUPS, the GTK 3 settings, the
+# download dir; the display, Wayland. Flathub's metadata also names the x11
+# socket, which flatpak.py does not ask for: fallback-x11 gives X11 where
+# there is no Wayland.
+LABEL flatpak.finish-args.desktop="\
+    --share=network \
+    --share=ipc \
+    --socket=wayland \
+    --socket=fallback-x11 \
+    --socket=pulseaudio \
+    --socket=cups \
+    --filesystem=xdg-config/gtk-3.0:ro \
+    --filesystem=xdg-download:rw"
+
+# speech-dispatcher, for the Web Speech API and Reader View's narration (its
+# client is the runtime's, where Mozilla's BaseApp brings its own).
+LABEL flatpak.finish-args.speech=--filesystem=xdg-run/speech-dispatcher:ro
+
+# D-Bus: the file manager ("Show in Folder"), the accessibility bus, the
+# host's gvfs (the runtime's gvfs-client), NetworkManager (online or not),
+# and the names Firefox owns: MPRIS, and org.mozilla.firefox.*, through
+# which a second `flatpak run` hands its URLs to the running one.
+LABEL flatpak.finish-args.dbus="\
+    --talk-name=org.freedesktop.FileManager1 \
+    --talk-name=org.a11y.Bus \
+    --talk-name=org.gtk.vfs.* \
+    --system-talk-name=org.freedesktop.NetworkManager \
+    --own-name=org.mpris.MediaPlayer2.firefox.* \
+    --own-name=org.mozilla.firefox.*"
+
+# ~/.mozilla, kept in the app's dir: native-messaging-hosts, where Firefox
+# always looks, and a profile from before Firefox's XDG layout (a new one is
+# made in the app's $XDG_CONFIG_HOME/mozilla); DICPATH, the runtime's
+# hunspell dictionaries (also files/lib/firefox/defaults/pref/flatpak.js).
+LABEL flatpak.finish-args.profile="--persist=.mozilla --env=DICPATH=/usr/share/hunspell"
+
+# Then the owner's four (README.md).
+# Downloads always in the host's ~/Downloads: xdg-download alone needs
+# ~/.config/user-dirs.dirs on the host.
+LABEL flatpak.finish-args.downloads=--filesystem=~/Downloads:create
+
+# Read-only what Noctalia v5 writes for the Pywalfox host (/app/bin/pywalfox):
+# - xdg-cache/wal: colors.json of Noctalia's pywalfox template
+# - xdg-config/pywalfox: the theme mode Noctalia keeps for the extension
+# - xdg-run/noctalia/firefox-theme: Noctalia's command file for running hosts
+LABEL flatpak.finish-args.noctalia="\
+    --filesystem=xdg-cache/wal:ro \
+    --filesystem=xdg-config/pywalfox:ro \
+    --filesystem=xdg-run/noctalia/firefox-theme:ro"
+
+# --- the test: the app, its ID and its permissions, with test.sh as its
+# command, which flatpak.sh test runs in the installed app's sandbox ---------
+FROM flatpak AS test
+COPY --chmod=0755 test.sh /app/bin/firefox-test
+LABEL flatpak.command=firefox-test

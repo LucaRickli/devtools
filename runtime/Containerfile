@@ -1,0 +1,197 @@
+# io.github.lucarickli.Platform//44: the runtime the apps in apps/ with a
+# Containerfile run on, Fedora's own packages for what GUI apps need (GTK 3
+# and 4, fonts, Mesa, the audio and D-Bus clients, Python) and for what its
+# apps link or run that Fedora has (Remmina's RDP, VNC and SPICE, the Craft
+# apps' lp). build/flatpak.sh makes the Flatpak runtime of the image of
+# the flatpak stage: its /usr becomes the runtime's files, its /etc their
+# etc; its labels, at the end of the stage, have the rest (ID, branch,
+# environment, GL extension point). The test stage, last, is an app on the
+# runtime whose command is the test (test.sh). x86_64 only.
+#
+# The apps build FROM this image too and keep only their /app
+# (apps/org.mozilla.firefox/Containerfile). So dnf and rpm stay, in the image
+# and with it in the runtime, where they and the rpm database cost some 35
+# MB: an app's build stage installs its build tools with them, and the scan
+# before the push (.github/actions/scan-image) asks this image's dnf which
+# Fedora security updates it lacks, against the record written below. A
+# separate sdk stage without them would be a second image for every build
+# and scan to keep apart, to save 5% of the runtime.
+#
+# Fedora's release is the runtime's branch. This FROM, flatpak.branch below,
+# and the flatpak.runtime of the test stage and of each app move together, in
+# Renovate's Fedora PR, twice a year (the test fails while the first two
+# differ); Fedora's updates come with every build.
+FROM registry.fedoraproject.org/fedora:44 AS flatpak
+
+# Fedora's updates first: the base image is days old, and dnf leaves a
+# package it finds installed at that version. English only: the base
+# image's %_install_langs (en_US) has rpm install a package's English files
+# (%lang(en), every English locale's) and leave out every other language's,
+# translations among them. The base image's own packages come with every
+# language's, so those that have another's are reinstalled under it too.
+# Then, without weak dependencies, each package below for what it is:
+# - GTK 3 and 4, libadwaita, and what they load at run time that is only a
+#   weak dependency, or none: librsvg2 (SVG icons), glib-networking (TLS for
+#   GIO), gvfs-client (the host's gvfs, to an app that may talk to
+#   org.gtk.vfs.*), at-spi2-atk (accessibility, GTK 3), cups-libs (GTK's
+#   CUPS print backend, for an app with the cups socket), util-linux
+#   (prlimit, which the base image's util-linux-core lacks: in a Flatpak,
+#   gdk-pixbuf's loaders, glycin's, run in a sandbox of their own through
+#   flatpak-spawn, under prlimit; without it no SVG loads, Adwaita's icons
+#   among them, and GTK 3 aborts on the icon it draws for a missing one; the
+#   test loads one);
+# - fonts: Fedora's defaults (Noto Sans, Serif and Mono, Noto Color Emoji,
+#   Cantarell), and Liberation, metric-compatible with the Arial, Times New
+#   Roman and Courier New that web pages and documents ask for. No CJK (30
+#   MB): the host's fonts are there as well (fontconfig, below). The
+#   Adwaita icons and cursors;
+# - Mesa's GL, EGL and GBM, its VA-API drivers (in mesa-dri-drivers), libva,
+#   libglvnd and the Vulkan loader. Not Mesa's Vulkan drivers (180 MB):
+#   NVIDIA's comes with its GL extension (the extension point, below);
+# - sound: ALSA, routed to PulseAudio (alsa-plugins-pulseaudio: in the
+#   sandbox there is the pulseaudio socket, no sound device), the PipeWire
+#   and PulseAudio clients; speech-dispatcher's;
+# - libnotify, libsecret, the CA certificates, D-Bus, Python 3 (an app's
+#   helpers: Firefox's Pywalfox host), diffutils (cmp, for those in sh),
+#   hunspell's English dictionary (en_US), glibc's English locales;
+# - flatpak-xdg-utils: xdg-open and xdg-email through the portal (below);
+# - Remmina's (apps/org.remmina.Remmina), what it and its plugins link:
+#   FreeRDP 3 (freerdp-libs, libwinpr: RDP), libvncserver (its libvncclient:
+#   VNC), vte291 (the terminal of SSH), spice-gtk3 (SPICE), libsodium,
+#   Ayatana's AppIndicator (the tray icon), avahi-ui-gtk3 (hosts on the
+#   LAN); and what it loads by name: pcsc-lite-libs (smart cards, which
+#   FreeRDP loads to redirect them) and gstreamer1-plugins-good (14 MB, for
+#   SPICE's sound alone: spice-gtk plays and records through its
+#   autoaudiosink and autoaudiosrc; a SPICE session is silent without it);
+# - the Craft apps' (apps/ai.storyteller.*): cups-client, the lp, lpstat and
+#   lpoptions that PdfCraft, WordCraft and GridCraft run to print, through
+#   the host's CUPS (the cups socket); libxkbcommon-x11, which winit loads for
+#   the keyboard on X11, where there is no Wayland (all four).
+# Last, from the same metadata (-C), the record of every security advisory
+# dnf knew for these packages, which the scan before the push goes by, as
+# for the dev container. The metadata comes first, three tries 30 s apart,
+# as every download here is retried (dnf retries the packages itself).
+RUN for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done \
+    && dnf -y upgrade \
+    && dnf -y reinstall $(rpm -qa --qf '%{NAME}[ %{FILELANGS}]\n' \
+        | awk '{ for (i = 2; i <= NF; i++) if ($i !~ /^en/) { print $1; break } }') \
+    && dnf -y --setopt=install_weak_deps=False install \
+        gtk3 gtk4 libadwaita librsvg2 glib-networking gvfs-client at-spi2-atk cups-libs util-linux \
+        fontconfig default-fonts-core-sans default-fonts-core-serif default-fonts-core-mono \
+        default-fonts-core-emoji liberation-sans-fonts liberation-serif-fonts liberation-mono-fonts \
+        adwaita-icon-theme adwaita-cursor-theme \
+        mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm libglvnd-glx libva vulkan-loader \
+        alsa-lib alsa-plugins-pulseaudio pipewire-libs pulseaudio-libs speech-dispatcher-libs \
+        libnotify libsecret ca-certificates dbus-libs python3 diffutils hunspell-en-US \
+        glibc-langpack-en flatpak-xdg-utils \
+        freerdp-libs libwinpr libvncserver vte291 spice-gtk3 libsodium libayatana-appindicator-gtk3 \
+        avahi-ui-gtk3 pcsc-lite-libs gstreamer1-plugins-good \
+        cups-client libxkbcommon-x11 \
+    && install -d /usr/share/fedora-bootc \
+    && dnf -q -C advisory list --security --all --repo=updates --json \
+        > /usr/share/fedora-bootc/advisories-at-build.json \
+    && dnf clean all
+
+# Fontconfig's configuration for a Flatpak runtime, as Fedora's own runtimes
+# have it: fontconfig/ is Fedora's flatpak-runtime-config (dist-git
+# rpms/flatpak-runtime-config, branch f44, d947a4c), whose package Fedora's
+# repositories do not carry. It adds the app's fonts and the host's, which
+# flatpak binds under /run/host, with the host's caches, and salts the
+# runtime's font dirs so that their caches are told apart from the host's
+# for the same paths.
+COPY fontconfig/ /etc/fonts/conf.d/
+
+# What makes it a Flatpak runtime rather than a system:
+# - xdg-open and xdg-email are flatpak-xdg-utils', which hand the URI or the
+#   mail to the host through the portal, as Fedora's own runtime names them.
+# - The font caches, built for the dirs as flatpak deploys them: ostree
+#   checks every directory out with mtime 0, and fontconfig takes a cache
+#   for a dir with another mtime as stale, so each app would build its own
+#   on its first start (the test checks it builds none). They go to
+#   /usr/cache/fontconfig, the first cache dir 50-flatpak.conf names; the
+#   fontconfig package's own, unsalted, go.
+# - GL: the GL extension point's directory (its label, below), and glvnd's and
+#   the Vulkan loader's /etc dirs pointing into it, where flatpak merges the
+#   driver's vendor and ICD files, as org.freedesktop.Platform has them.
+# - ld.so: an empty /etc/ld.so.conf, so that flatpak writes its own (the
+#   app's /app/lib, and what the app's and the runtime's extensions, the GL
+#   driver among them, add), as org.freedesktop.Platform has it; with any
+#   other, flatpak's ld.so cache lacks the extensions' libraries, and
+#   NVIDIA's GL driver does not load (flatpak.sh build checks it). Fedora's
+#   includes ld.so.conf.d, so that must be empty: what a package put there
+#   would be dropped.
+# - Nothing of a system's: no systemd units or presets, no build-id links of
+#   debug info that is not there, no /var (flatpak gives each app its own).
+RUN ln -s flatpak-xdg-open /usr/bin/xdg-open \
+    && ln -s flatpak-xdg-email /usr/bin/xdg-email \
+    && rm -rf /usr/lib/fontconfig/cache /var/cache/fontconfig \
+    && mkdir -p /usr/cache/fontconfig \
+    && find /usr/share/fonts -type d -exec touch -d @0 {} + \
+    && fc-cache -s -f \
+    && mkdir -p /usr/lib64/GL \
+    && rm -rf /etc/glvnd && ln -s ../lib64/GL/glvnd /etc/glvnd \
+    && rm -rf /etc/vulkan && ln -s ../lib64/GL/vulkan /etc/vulkan \
+    && test -z "$(ls -A /etc/ld.so.conf.d)" && : >/etc/ld.so.conf && ldconfig \
+    && rm -rf /usr/lib/systemd/system /usr/lib/systemd/user /usr/lib/systemd/*-preset \
+        /usr/lib/.build-id /var
+
+# --- what the image does not say: the flatpak.* labels ----------------------
+# The runtime's ID, and its branch, the image's Fedora release (the FROM
+# above).
+LABEL flatpak.id=io.github.lucarickli.Platform \
+      flatpak.branch=44
+
+# The environment Flathub's runtimes set (org.freedesktop.Platform's
+# metadata), for what an app puts in /app, which here comes from Fedora
+# packages too: libraries and modules in lib64, not lib. flatpak's own ld.so
+# cache has /app/lib only (ld.so, above), hence LD_LIBRARY_PATH.
+# XDG_DATA_DIRS ends in the host's share dirs, which flatpak binds in part
+# (its icons, for their themes); XCURSOR_PATH does the same for the cursors
+# that GTK 3 and Xcursor load themselves, the host's theme first.
+# GST_PLUGIN_SYSTEM_PATH replaces GStreamer's default, so it names it too.
+# The last two are the GL extension's (below).
+LABEL flatpak.finish-args.env="\
+    --env=PATH=/app/bin:/usr/bin \
+    --env=LD_LIBRARY_PATH=/app/lib64 \
+    --env=XDG_DATA_DIRS=/app/share:/usr/share:/run/host/user-share:/run/host/share \
+    --env=GI_TYPELIB_PATH=/app/lib64/girepository-1.0 \
+    --env=GST_PLUGIN_SYSTEM_PATH=/app/lib64/gstreamer-1.0:/usr/lib64/gstreamer-1.0 \
+    --env=XCURSOR_PATH=/run/host/user-share/icons:/run/host/share/icons:/usr/share/icons \
+    --env=__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/etc/egl/egl_external_platform.d:/usr/lib64/GL/egl/egl_external_platform.d:/usr/share/egl/egl_external_platform.d \
+    --env=GBM_BACKENDS_PATH=/usr/lib64/GL/lib/gbm:/usr/lib64/gbm"
+
+# The GL drivers as Flathub ships them, for its 1.4 branch, which follows the
+# host's driver: flatpak installs the one active-gl-driver names (NVIDIA's,
+# org.freedesktop.Platform.GL.nvidia-<version>, matches the host's kernel
+# module) into lib64/GL/<name>, puts its lib on the ld.so path and merges the
+# subdirectories below into lib64/GL, where /etc/glvnd and /etc/vulkan point
+# (above). Without one, as on Mesa's GPUs, Mesa in the runtime serves. The
+# extension point is one --extension option for each key of its group in the
+# metadata, with org.freedesktop.Platform's values, for lib64, less vdpau
+# (no libvdpau here). Two merged dirs need the runtime's environment, as
+# their users here are Fedora's builds, which look elsewhere:
+# egl/egl_external_platform.d holds NVIDIA's EGL platforms for Wayland, xcb
+# and GBM, which its EGL lacks without __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS
+# (and with it apps on Wayland fall back to software); lib/gbm holds its GBM
+# backend, which libgbm takes for NVIDIA's device only from
+# GBM_BACKENDS_PATH, Mesa's own (/usr/lib64/gbm) after it.
+LABEL flatpak.finish-args.gl="\
+    --extension=org.freedesktop.Platform.GL=version=1.4 \
+    --extension=org.freedesktop.Platform.GL=directory=lib64/GL \
+    --extension=org.freedesktop.Platform.GL=subdirectories=true \
+    --extension=org.freedesktop.Platform.GL=add-ld-path=lib \
+    --extension=org.freedesktop.Platform.GL=merge-dirs=vulkan/icd.d;glvnd/egl_vendor.d;egl/egl_external_platform.d;OpenCL/vendors;lib/dri;lib/d3d;lib/gbm;vulkan/explicit_layer.d;vulkan/implicit_layer.d \
+    --extension=org.freedesktop.Platform.GL=download-if=active-gl-driver \
+    --extension=org.freedesktop.Platform.GL=enable-if=active-gl-driver \
+    --extension=org.freedesktop.Platform.GL=autoprune-unless=active-gl-driver \
+    --extension=org.freedesktop.Platform.GL=no-autodownload=true \
+    --extension=org.freedesktop.Platform.GL=autodelete=false"
+
+# --- the test: an app of its own on the runtime, FROM scratch so that none
+# of the labels above apply to it, whose command is test.sh. flatpak.sh test
+# runs it in its sandbox, on the runtime as every app sees it ---------------
+FROM scratch AS test
+COPY --chmod=0755 test.sh /app/bin/platform-test
+LABEL flatpak.id=io.github.lucarickli.Platform.Test \
+      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.command=platform-test

@@ -1,0 +1,319 @@
+# Build the development container (devcontainer/Containerfile) and push it to
+# ghcr.io/<owner>/devcontainer: its plain stage as :latest and :<yyyymmdd>,
+# its ai stage (the same with Claude Code) as :ai and :<yyyymmdd>-ai. Both
+# are signed with the OS's cosign key: on a machine running the OS, podman
+# refuses them unsigned (its policy.json), so toolbox and Dev Containers on
+# podman do too; docker reads no policy.json. Baked (build/docker-bake.hcl,
+# the devcontainer targets) on the registry cache flatpaks.yml's jobs use
+# too, ghcr.io/<owner>/packages-cache, which only a run on main writes
+# (build/ci.sh). Weekly as well, and by hand, built again without the cache
+# (FRESH), so the Fedora packages in them stay current without a commit.
+# Run by hand with `security` set, the scan requires those Fedora security
+# updates. Pull requests get it through ci.yml, the PR gate, and only
+# build, test and scan, as does a run by hand on a branch other than main.
+name: devcontainer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "devcontainer/**"
+      - "tools/**"
+      - "!tools/verify-pins.sh"
+      - "keys/claude-code.asc"
+      # what bakes it, and the scripts this workflow runs
+      - "build/docker-bake.hcl"
+      - "build/build.sh"
+      - "build/ci.sh"
+      - "build/private.sh"
+      - ".github/workflows/devcontainer.yml"
+      - ".github/actions/**"
+  schedule:
+    # 09:41 UTC, off the top of the hour, when GitHub delays or drops
+    # scheduled runs, and after flatpaks.yml's (09:23)
+    - cron: "41 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      security:
+        description: "Fedora security updates this rebuild is for, as ADVISORY SEVERITY PACKAGES separated by ';': the image must contain them, or the build fails"
+        required: false
+        type: string
+  workflow_call:
+
+# Only pull requests supersede each other. Any other run waits for the one
+# before it, which, cancelled between its push and `sign`, would leave the
+# tags on an unsigned image; one still pending when a newer one queues is
+# dropped (the newer one builds the same, and newer).
+concurrency:
+  group: devcontainer-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write          # the cache, the push
+      security-events: write   # scan results to code scanning (scan-image)
+    outputs:
+      pushed: ${{ steps.push.outputs.pushed }}
+    env:
+      LOCAL: localhost/devcontainer:ci-${{ github.run_id }}
+      LOCAL_AI: localhost/devcontainer:ci-${{ github.run_id }}-ai
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The builder's cache, the two OCI image layouts (1.4 GB each) and
+      # podman's copy of them (4.3 GB, ai's layers mostly plain's): some
+      # 15 GB.
+      - name: Prepare the runner
+        uses: ./.github/actions/prepare-runner
+        with:
+          need: "25"
+
+      - name: Set up buildx
+        uses: ./.github/actions/buildx
+
+      # The cache is a private package: read on every run, a pull
+      # request's too, written on main.
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # ai is plain with a few layers on top, built with it in one bake:
+      # the same stages, so the same layers, on the same base (were Fedora's
+      # newer for ai, it would be all new layers, untested), fresh or not.
+      # The Test step checks it. Into output/images/devcontainer and
+      # devcontainer-ai, OCI image layouts, which the push copies, and into
+      # rootless podman's storage as LOCAL and LOCAL_AI, which the test and
+      # the scan run (build/ci.sh devcontainer). The contexts: devcontainer/,
+      # and tools/ and keys/ as `tools` and `keys`, which the Containerfile
+      # copies the shared files from.
+      - name: Build
+        env:
+          EVENT: ${{ github.event_name }}
+          FRESH: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          GH_TOKEN: ${{ github.token }}   # a re-run writes no cache where main moved on
+        run: build/ci.sh devcontainer
+
+      # Every tool runs and the toolchains build (test.sh, the same
+      # test the Flatpak gets), and the VS Code extensions are in place, for
+      # the user Dev Containers connects as. In plain: ai has all of its
+      # layers, and what ai adds is tested on its own below.
+      - name: Test
+        run: |
+          podman run --rm --user dev -v "$PWD/tools/test.sh":/run/test.sh:ro \
+            -v "$PWD/tools/tools.txt":/run/tools.txt:ro "$LOCAL" bash -l /run/test.sh
+          podman run --rm --user dev "$LOCAL" bash -lc '
+            set -eux
+            ls ~/.vscode-server/extensions | grep -E "^golang\.go-"
+            ls ~/.vscode-server/extensions | grep -E "^denoland\.vscode-deno-"
+            ls ~/.vscode-server/extensions | grep -E "^rust-lang\.rust-analyzer-"'
+          # The host's podman, docker and qemu (host-command): with
+          # no session bus, as here and in any Dev Container, they say so; one
+          # installed in the container wins. Also where the links come up
+          # twice on PATH (/usr/local/sbin is a link to bin): under sudo, and
+          # on a host PATH that a toolbox passes on.
+          podman run --rm --user dev "$LOCAL" bash -c '
+            set -eux
+            for c in podman docker qemu-img qemu-system-x86_64; do
+              rc=0; "$c" --version 2>/tmp/err || rc=$?
+              test "$rc" = 127
+              grep -q "session bus" /tmp/err
+              rc=0; timeout 10 sudo "$c" --version 2>/tmp/err || rc=$?
+              test "$rc" = 127
+              grep -q "session bus" /tmp/err
+              rc=0; PATH=/usr/local/sbin:$PATH timeout 10 "$c" --version 2>/tmp/err || rc=$?
+              test "$rc" = 127
+              grep -q "session bus" /tmp/err
+            done
+            mkdir /tmp/bin && printf "#!/bin/sh\necho installed\n" >/tmp/bin/podman && chmod +x /tmp/bin/podman
+            test "$(PATH=$PATH:/tmp/bin podman)" = installed
+            sudo install /tmp/bin/podman /usr/bin/podman
+            test "$(timeout 10 sudo podman)" = installed'
+          # Claude Code (claude), in ai: the image holds only its pin, the
+          # Flatpak's version with Anthropic's URL, sha256 and size, and
+          # nothing is downloaded here. Offline it fails and leaves nothing
+          # behind; its updates are off; ~/.claude is the user's, for a
+          # volume (devcontainer/README.md). plain has none of it.
+          pin=$(sed -n 's/^ARG CLAUDE_VERSION=//p' devcontainer/Containerfile)
+          test "$pin" = "$(sed -n 's/^ARG CLAUDE_VERSION=//p' apps/io.github.lucarickli.Code/Containerfile)"
+          podman run --rm --user dev --network=none -e PIN="$pin" "$LOCAL_AI" bash -c '
+            set -eux
+            read -r version url sha256 size </usr/local/share/claude-code/pin
+            test "$version" = "$PIN"
+            test "$url" = "https://downloads.claude.ai/claude-code-releases/$PIN/linux-x64/claude"
+            [[ $sha256 =~ ^[0-9a-f]{64}$ && $size =~ ^[1-9][0-9]*$ ]]
+            rc=0; claude --version 2>/tmp/err || rc=$?
+            test "$rc" = 1
+            grep -q "nothing installed" /tmp/err
+            test -z "$(ls -A ~/.local/share/claude-code/"$PIN")"
+            test "$DISABLE_UPDATES" = 1
+            test "$DISABLE_INSTALLATION_CHECKS" = 1
+            test "$(stat -c "%a %U" ~/.claude)" = "700 dev"'
+          podman run --rm --user dev "$LOCAL" bash -c '
+            set -eux
+            if command -v claude; then exit 1; fi
+            test ! -e /usr/local/share/claude-code
+            test ! -e ~/.claude
+            test -z "${DISABLE_UPDATES:-}${DISABLE_INSTALLATION_CHECKS:-}"'
+          # ai is plain, every layer of it, and a few more; so the tests
+          # above that ran in plain hold for ai.
+          layers() { podman image inspect --format '{{json .RootFS.Layers}}' "$1"; }
+          jq -e --argjson plain "$(layers "$LOCAL")" '.[:($plain | length)] == $plain' <<<"$(layers "$LOCAL_AI")"
+          # Dev Containers' metadata: plain's names no Claude Code
+          # extension, ai's is plain's with it added (Containerfile).
+          label() { podman image inspect --format '{{index .Labels "devcontainer.metadata"}}' "$1"; }
+          jq -e '[.[].customizations.vscode.extensions[]?] | all(. != "anthropic.claude-code")' <<<"$(label "$LOCAL")"
+          jq -e --argjson plain "$(label "$LOCAL")" \
+            '. == ($plain | .[0].customizations.vscode.extensions += ["anthropic.claude-code"])' <<<"$(label "$LOCAL_AI")"
+          # EDITOR in a Dev Containers terminal (VS Code's remote `code` on
+          # PATH, its socket in VSCODE_IPC_HOOK_CLI) is that window; elsewhere
+          # Fedora's default.
+          podman run --rm --user dev "$LOCAL" bash -c '
+            set -eux
+            mkdir /tmp/cli && printf "#!/bin/sh\n" >/tmp/cli/code && chmod +x /tmp/cli/code
+            python3 -c "import socket; socket.socket(socket.AF_UNIX).bind(\"/tmp/ipc.sock\")"
+            hook="env VSCODE_IPC_HOOK_CLI=/tmp/ipc.sock PATH=/tmp/cli:$PATH EDITOR=/usr/bin/nano"
+            test "$($hook bash -ic "git var GIT_EDITOR" 2>/dev/null)" = "code --wait"
+            test "$($hook fish -c "git var GIT_EDITOR")" = "code --wait"
+            test "$(bash -ic "git var GIT_EDITOR" 2>/dev/null)" = /usr/bin/nano
+            test "$(fish -c "git var GIT_EDITOR")" = /usr/bin/nano'
+          # mise (mise-system.sh) with no network: the Go and Deno of
+          # tools.txt are its installs. fish activates it also where
+          # XDG_DATA_DIRS leaves out /usr/local/share (a toolbox passes the
+          # host's on), and only once; a mise.toml changed since `mise trust`
+          # waits for it again. Its shims come after the image's tools on a
+          # login shell's PATH.
+          go=$(awk '$1 == "go" { print $2 }' tools/tools.txt)
+          deno=$(awk '$1 == "deno" { sub(/^v/, "", $2); print $2 }' tools/tools.txt)
+          podman run --rm --user dev --network=none -e GO="$go" -e DENO="$deno" "$LOCAL" bash -c '
+            set -eux
+            cd "$(mktemp -d)"
+            printf "[tools]\ngo = \"%s\"\ndeno = \"%s\"\n" "$GO" "$DENO" >mise.toml
+            mise trust -q
+            test "$(PATH=/usr/local/bin mise exec -- go env GOVERSION)" = "go$GO"
+            test "$(PATH=/usr/local/bin mise exec -- deno --version | head -1 | cut -d" " -f2)" = "$DENO"
+            test "$(XDG_DATA_DIRS=/usr/share fish -c "go env GOROOT")" = "/usr/local/share/mise/installs/go/$GO"
+            printf "[tools]\ngo = \"1.20.0\"\n" >mise.toml
+            test "$(fish -c true 2>&1 | grep -c "is not trusted")" = 1
+            mise trust -q
+            test "$(fish -c true 2>&1 | grep -c "missing: go@1.20.0")" = 1
+            shims=~/.local/share/mise/shims
+            mkdir -p "$shims" && printf "#!/bin/sh\necho shim\n" | tee "$shims/go" >"$shims/node"
+            chmod +x "$shims/go" "$shims/node"
+            test "$(bash -lc "command -v go")" = /usr/local/go/bin/go
+            test "$(bash -lc node)" = shim'
+
+      # Before the push (.github/actions/scan-image), each image that is
+      # pushed. Everything outside Fedora's packages is a pinned upstream
+      # release: the tools under /usr/local and the VS Code extensions.
+      - name: Scan
+        uses: ./.github/actions/scan-image
+        with:
+          image: ${{ env.LOCAL }}
+          name: devcontainer
+          upstream-paths: usr/local/ var/home/dev/.vscode-server/
+          require: ${{ inputs.security }}
+
+      - name: Scan ai
+        uses: ./.github/actions/scan-image
+        with:
+          image: ${{ env.LOCAL_AI }}
+          name: devcontainer-ai
+          upstream-paths: usr/local/ var/home/dev/.vscode-server/
+          require: ${{ inputs.security }}
+
+      # Each tag's digest, for `sign` (an image's two tags are the same
+      # manifest, which skopeo copies from the layout byte for byte, so one
+      # digest each), recorded as soon as it is pushed: `sign` signs
+      # whatever was, also when a later push fails, as a machine refuses an
+      # unsigned tag. One date for both images, also when the push runs
+      # past midnight. The dated tags first, the moving ones last: a push
+      # that fails leaves at most one moving tag moved (:latest, when :ai
+      # fails), and signed. skopeo retries each push, and each is tried
+      # three times, 30 s apart. Nothing goes to a package that is public
+      # (build/private.sh): the images are the owner's alone.
+      - name: Push
+        id: push
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/devcontainer"
+          build/private.sh "$image"
+          day=$(date -u +%Y%m%d)
+          mkdir -p "${RUNNER_TEMP}/pushed"
+          # push LAYOUT TAG
+          push() {
+            local attempt
+            for attempt in 1 2 3; do
+              skopeo copy --retry-times 3 --digestfile "${RUNNER_TEMP}/digest" "oci:$1" "docker://$image:$2" && break
+              [ "$attempt" != 3 ] || { echo "::error::could not push $image:$2"; exit 1; }
+              echo "push of $image:$2 failed (attempt $attempt), retrying in 30s" >&2
+              sleep 30
+            done
+            echo "${image}@$(cat "${RUNNER_TEMP}/digest")" >> "${RUNNER_TEMP}/pushed/devcontainer"
+            sort -u -o "${RUNNER_TEMP}/pushed/devcontainer" "${RUNNER_TEMP}/pushed/devcontainer"
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          }
+          push output/images/devcontainer "$day"
+          push output/images/devcontainer-ai "$day-ai"
+          push output/images/devcontainer latest
+          push output/images/devcontainer-ai ai
+
+      - name: Record the digest
+        if: always() && steps.push.outputs.pushed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pushed-devcontainer
+          path: ${{ runner.temp }}/pushed/devcontainer
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: true
+
+  # The cosign key in a job of its own that runs nothing but checkout, the
+  # artifact download and cosign (.github/actions/sign has the why). Until it
+  # has run, the new tags are unsigned, and a machine refuses to pull them:
+  # so it runs whenever anything was pushed, also when the build job failed
+  # after that.
+  sign:
+    name: sign
+    needs: build
+    if: >-
+      !cancelled() && needs.build.outputs.pushed == 'true' &&
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    environment: release   # the cosign key
+    permissions:
+      contents: read    # keys/cosign.pub
+      packages: write   # the signature
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The pushed digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pushed-devcontainer
+          path: ${{ runner.temp }}/pushed
+
+      - name: Sign and verify
+        uses: ./.github/actions/sign
+        with:
+          refs-dir: ${{ runner.temp }}/pushed
+          cosign-key: ${{ secrets.SIGNING_SECRET }}
+          registry-token: ${{ github.token }}

@@ -1,0 +1,203 @@
+# org.remmina.Remmina: Remmina, the remote desktop client, built from its
+# release's tag on io.github.lucarickli.Platform, the runtime in runtime/,
+# with RDP (FreeRDP 3), VNC, SSH and SFTP, SPICE, the exec plugin and
+# passwords in the Secret Service. The app is /app alone, Remmina as it
+# installs itself; the libraries it links are the runtime's, Fedora's
+# packages (runtime/Containerfile names those it has for it). The
+# labels of the flatpak stage have the permissions, tighter than Flathub's
+# (no host commands, the home read-only), the test stage the test
+# (test.sh), README.md what differs from Flathub's Remmina and why, and the
+# overrides that give back what the tighter sandbox takes.
+
+# The runtime's image, the flatpak stage of runtime/Containerfile, is the
+# named context runtime (build/docker-bake.hcl), which the build stage is
+# FROM. The runtime's branch is named once here, in flatpak.runtime below,
+# and a build without the context fails at once.
+
+# --- build: on the runtime's image, so that Remmina is built against the
+# libraries it will run with; only /app leaves it --------------------------
+FROM runtime AS build
+
+# The build tools, then the -devel package of each library Remmina links,
+# by the pkg-config name its CMake modules look for, as in Fedora's
+# remmina.spec: GTK 3; FreeRDP 3 and WinPR (RDP); libvncclient (VNC); libssh
+# and VTE (SSH, SFTP, the terminal); spice-gtk (SPICE); libsecret (the
+# secret plugin); libsodium, json-glib, curl, PCRE2, OpenSSL and libgcrypt
+# (Remmina's own); Ayatana's AppIndicator (the tray icon), Avahi's client
+# and GTK dialogs (hosts on the LAN), CUPS (the printers RDP redirects).
+# And FreeRDP's own package, as in Fedora's spec: WinPR's CMake targets
+# name its winpr-makecert and winpr-hash, and fail without them. In a layer
+# of their own, kept while only the release moves. The metadata first,
+# retried, as for the runtime.
+RUN for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done \
+    && dnf -y --setopt=install_weak_deps=False install \
+        git-core cmake ninja-build gcc gcc-c++ desktop-file-utils freerdp \
+        'pkgconfig(gtk+-3.0)' 'pkgconfig(freerdp3)' 'pkgconfig(freerdp-client3)' 'pkgconfig(winpr3)' \
+        'pkgconfig(libvncclient)' 'pkgconfig(libssh)' 'pkgconfig(vte-2.91)' \
+        'pkgconfig(spice-client-gtk-3.0)' 'pkgconfig(libsecret-1)' 'pkgconfig(libsodium)' \
+        'pkgconfig(json-glib-1.0)' 'pkgconfig(libcurl)' 'pkgconfig(libpcre2-8)' 'pkgconfig(openssl)' \
+        'pkgconfig(libgcrypt)' 'pkgconfig(ayatana-appindicator3-0.1)' 'pkgconfig(avahi-client)' \
+        'pkgconfig(avahi-ui-gtk3)' 'pkgconfig(cups)' \
+    && dnf clean all
+
+# Remmina's release, from its repository at the tag, which must be the
+# commit pinned with it: upstream signs neither tags nor releases and
+# publishes no checksums (a release has only the archives GitLab makes on
+# each download), so the commit is the pin, which git checks the fetched
+# objects against; Flathub's manifest pins the same. Renovate moves the two
+# together (gitlab-tags gives the tag's commit). CMake: Fedora's options and
+# Flathub's, for FreeRDP 3; off what this build leaves out (README.md):
+# Python plugins and WWW (X2Go, KWallet, GVNC and the kiosk session are off
+# by default); news, usage statistics and tips, which talk to remmina.org;
+# translations (English only, as the runtime is); man pages, and the icon
+# and desktop caches, which flatpak builds. Fedora's hardening, which its
+# packages get from redhat-rpm-config: fortified, stack-protected, PIE, full
+# RELRO; -pie in the executables' linker flags, which take LDFLAGS' place
+# for them, and -fPIE for CMake's own test programs, which it links with
+# those (without it they fail, and CMake no longer looks in lib64); Remmina
+# adds its -fPIC after it. CMake's build type is Release (-O3).
+# renovate: datasource=gitlab-tags depName=Remmina/Remmina
+ARG REMMINA_VERSION=v1.4.43 REMMINA_COMMIT=7be0cf2348d149c6bf5bd882fe91d3bec7d6aebb
+RUN set -eux; \
+    for i in 1 2 3; do \
+        git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$REMMINA_VERSION" \
+            https://gitlab.com/Remmina/Remmina.git /src && break; \
+        rm -rf /src; [ "$i" != 3 ] || exit 1; sleep 30; \
+    done; \
+    test "$(git -C /src rev-parse HEAD)" = "$REMMINA_COMMIT"; \
+    export CFLAGS='-fPIE -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection -fcf-protection'; \
+    export CXXFLAGS="$CFLAGS" LDFLAGS='-Wl,-z,relro -Wl,-z,now'; \
+    cmake -S /src -B /src/build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/app \
+        -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS -pie" \
+        -DWITH_FREERDP3=ON \
+        -DWITH_PYTHONLIBS=OFF \
+        -DWITH_WWW=OFF \
+        -DWITH_NEWS=OFF \
+        -DWITH_STATS=OFF \
+        -DWITH_TIP=OFF \
+        -DWITH_TRANSLATIONS=OFF \
+        -DWITH_MANPAGES=OFF \
+        -DWITH_ICON_CACHE=OFF \
+        -DWITH_UPDATE_DESKTOP_DB=OFF; \
+    cmake --build /src/build; \
+    cmake --install /src/build; \
+    rm -rf /src /app/include /app/lib64/pkgconfig
+
+# The app as it will run: Remmina starts and is this release at this
+# commit; each plugin is there, and SSH and SFTP, which are Remmina's own,
+# have libssh and VTE; every library Remmina and the plugins link resolves
+# (here against the build's libraries; the test checks it again in the
+# sandbox, against the runtime's alone); each is PIE or PIC, with full
+# RELRO; the desktop files are valid, and every file of those build-finish
+# exports, the desktop files, the metainfo, the MIME types and the icons,
+# is named after the app ID, as it exports no other.
+RUN set -eux; \
+    case "$(/app/bin/remmina --version)" in \
+        *" ${REMMINA_VERSION#v} (git $(printf %.7s "$REMMINA_COMMIT")"*) ;; \
+        *) exit 1 ;; \
+    esac; \
+    for p in rdp vnc spice exec secret; do test -f "/app/lib64/remmina/plugins/remmina-plugin-$p.so"; done; \
+    ldd /app/bin/remmina | grep -q 'libssh\.so'; \
+    ldd /app/bin/remmina | grep -q 'libvte-2\.91\.so'; \
+    missing=$(find /app -type f \( -name '*.so' -o -perm -u+x \) -exec ldd {} + 2>/dev/null | grep 'not found' || :); \
+    test -z "$missing"; \
+    for f in /app/bin/remmina /app/lib64/remmina/plugins/*.so; do \
+        readelf -lW "$f" | grep -q GNU_RELRO; \
+        readelf -dW "$f" | grep -q 'BIND_NOW'; \
+    done; \
+    readelf -hW /app/bin/remmina | grep -q 'DYN (Position-Independent Executable'; \
+    desktop-file-validate /app/share/applications/org.remmina.Remmina.desktop \
+        /app/share/applications/org.remmina.Remmina-file.desktop; \
+    test -f /app/share/metainfo/org.remmina.Remmina.appdata.xml; \
+    test -f /app/share/mime/packages/org.remmina.Remmina-mime.xml; \
+    test -f /app/share/icons/hicolor/scalable/apps/org.remmina.Remmina.svg; \
+    test -z "$(find /app/share/applications /app/share/metainfo /app/share/mime/packages \
+        /app/share/icons/hicolor/*/apps -type f ! -name 'org.remmina.Remmina.*' ! -name 'org.remmina.Remmina-*')"
+
+# --- the app: /app, nothing else, and the flatpak.* labels ------------------
+# FROM scratch, so that none of the runtime image's labels (its ID, its
+# environment, its GL extension point) carry over into the app's.
+FROM scratch AS flatpak
+COPY --from=build /app /app
+
+# The app's ID, Flathub's, so that the profiles, settings and passwords of
+# Flathub's Remmina (~/.var/app/org.remmina.Remmina) stay in use; the
+# runtime it runs on, whose branch is Fedora's release
+# (runtime/Containerfile); the command, Remmina.
+LABEL flatpak.id=org.remmina.Remmina \
+      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.command=remmina
+
+# The permissions, one group for each reason: Flathub's (the finish-args of
+# org.remmina.Remmina.json, github.com/flathub/org.remmina.Remmina, at
+# e413f209, 1.4.43; upstream's flatpak/ has the same), with the files and
+# the host's commands tightened (below). Left out, as this
+# build has nothing they serve: OPENSSL_CONF (Flathub's configuration that
+# loads OpenSSL's legacy provider, for NTLM's MD4: FreeRDP 3 loads it
+# itself, and the runtime's OpenSSL has it), DCONF_USER_CONFIG_DIR and
+# ca.desrt.dconf (no dconf in the runtime: GSettings keeps a keyfile in the
+# app's dir), org.kde.kwalletd5 (no KWallet plugin), org.gnome.Shell (read
+# only for the usage statistics, which are off), com.canonical.Unity (never
+# called), org.freedesktop.Notifications (GLib sends a Flatpak's
+# notifications through the portal) and xdg-run/pipewire-0 (no PipeWire
+# client here: sound is PulseAudio's).
+#
+# The network; the display, Wayland, X11 where there is no Wayland, and
+# X11's shared memory (ipc); the sound and the microphone that RDP and SPICE
+# redirect (pulseaudio); the host's CUPS, for the printers RDP redirects.
+LABEL flatpak.finish-args.desktop="\
+    --share=network \
+    --share=ipc \
+    --socket=wayland \
+    --socket=fallback-x11 \
+    --socket=pulseaudio \
+    --socket=cups"
+
+# What RDP and SPICE redirect from this machine besides: USB devices (every
+# device: libusb opens them in /dev/bus/usb), RDP's serial and parallel
+# ports, and smart cards, through the host's pcscd (pcsc; FreeRDP loads
+# libpcsclite for them, SPICE's libcacard links it).
+LABEL flatpak.finish-args.devices="--device=all --socket=pcsc"
+
+# SSH's keys in the session's agent (ssh-auth). The home dir read-only (on
+# Flathub read-write): what SFTP sends, a folder shared over RDP, a profile
+# imported, a key file a profile names, ~/.ssh/config. Read-write, two
+# places: ~/.ssh/known_hosts, which SSH and SFTP add a new host's key to
+# (where it exists: flatpak makes no file), and the download dir, also
+# where it is not in the home, for what SFTP fetches and a profile exported.
+LABEL flatpak.finish-args.files="\
+    --socket=ssh-auth \
+    --filesystem=home:ro \
+    --filesystem=~/.ssh/known_hosts \
+    --filesystem=xdg-download"
+
+# D-Bus: the host's Secret Service, for the passwords where there is no
+# Secret portal (with one, libsecret keeps them in its own keyring in the
+# app's dir, under a key the portal hands out); the tray icon (Ayatana's
+# AppIndicator: a StatusNotifierItem, or the indicator services of Ayatana
+# and Canonical); the host's gvfs, for its mounts in the file chooser.
+LABEL flatpak.finish-args.dbus="\
+    --talk-name=org.freedesktop.secrets \
+    --talk-name=org.kde.StatusNotifierWatcher \
+    --talk-name=com.canonical.indicator.application \
+    --talk-name=org.ayatana.indicator.application \
+    --talk-name=org.gtk.vfs.* \
+    --filesystem=xdg-run/gvfsd"
+
+# Hosts on the LAN, which Remmina's dialogs find through the host's
+# avahi-daemon.
+LABEL flatpak.finish-args.avahi=--system-talk-name=org.freedesktop.Avahi
+
+# Not granted, where Flathub grants it: org.freedesktop.Flatpak, any command
+# on the host as the user, through which Remmina runs, with `flatpak-spawn
+# --host`, what the exec plugin runs, a profile's commands before and after
+# it connects, and xauth for SSH's X11 forwarding. Without it those fail and
+# the rest works; README.md has the override that grants it.
+
+# --- the test: the app, its ID and its permissions, with test.sh as its
+# command, which flatpak.sh test runs in the installed app's sandbox ---------
+FROM flatpak AS test
+COPY --chmod=0755 test.sh /app/bin/remmina-test
+LABEL flatpak.command=remmina-test

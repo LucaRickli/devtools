@@ -1,0 +1,29 @@
+#!/bin/sh
+# /app/bin/fish, the terminal's shell: runs fish (/app/libexec/fish) with
+# your dotfiles.
+#
+#   fish [ARG...]
+#
+# flatpak points XDG_CONFIG_HOME at this app's own directory, and shows
+# ~/.config/fish read-only (the Containerfile's labels). So the fish
+# directory in XDG_CONFIG_HOME links to what is in yours, entry by entry.
+# That way fish_variables (`set -U`) stays the app's own, and writable. A
+# link to the whole directory, which this script made before, is replaced.
+config=$XDG_CONFIG_HOME/fish
+if [ -L "$config" ] && [ "$(readlink "$config")" = "$HOME/.config/fish" ]; then
+    rm "$config"
+fi
+mkdir -p "$config"
+for entry in config.fish conf.d functions completions themes; do
+    if [ -e "$HOME/.config/fish/$entry" ] && [ ! -e "$config/$entry" ] && [ ! -L "$config/$entry" ]; then
+        ln -s "$HOME/.config/fish/$entry" "$config/$entry"
+    fi
+done
+
+# The same TMPDIR as the launcher (code) sets, also for
+# `flatpak run --command=fish`. claude-sandboxed's box has no such
+# directory, so TMPDIR stays as it is there.
+if [ -d "$XDG_RUNTIME_DIR/app/$FLATPAK_ID" ]; then
+    export TMPDIR="$XDG_RUNTIME_DIR/app/$FLATPAK_ID"
+fi
+exec /app/libexec/fish "$@"

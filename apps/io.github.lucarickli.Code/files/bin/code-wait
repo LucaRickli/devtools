@@ -1,0 +1,10 @@
+#!/bin/sh
+# /app/bin/code-wait: runs `code --wait`, as one word, for the app's
+# EDITOR and VISUAL (the Containerfile's labels). The labels end an option's
+# value at the first whitespace, so `code --wait` cannot be the value itself.
+#
+#   code-wait FILE...
+#
+# git, sops, kubectl and gh then edit in VS Code, in the running window of
+# any instance of the app, and wait for the tab to close.
+exec /app/bin/code --wait "$@"

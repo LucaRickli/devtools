@@ -1,0 +1,18 @@
+#!/bin/sh
+#
+# /app/bin/firefox: Firefox's launcher, as Mozilla's own Flatpak has it,
+# except that it runs /app/libexec/firefox-prestart first.
+#
+#   firefox [ARG...]
+
+# The prestart sets up downloads and the Pywalfox host's manifest. It is
+# never fatal: Firefox starts whatever happens there.
+/app/libexec/firefox-prestart || :
+# TMPDIR is on disk, in the app's cache dir. The sandbox's /tmp is the
+# app's directory in $XDG_RUNTIME_DIR, which is in memory.
+export TMPDIR="${XDG_CACHE_HOME:-$HOME/.cache}/tmp"
+mkdir -p "$TMPDIR"
+# --name makes Firefox's Wayland app ID (and X11 instance name) the desktop
+# file's, org.mozilla.firefox. The desktop then gives its windows that
+# file's name and icon.
+exec /app/lib/firefox/firefox --name org.mozilla.firefox "$@"
