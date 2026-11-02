@@ -43,7 +43,7 @@ COPY --from=tools mise-system.sh mise-config.toml tools.txt /
 # that satisfies the extensions' `engines` uses them.
 FROM registry.fedoraproject.org/fedora-toolbox:44 AS vscode-extensions
 # renovate: datasource=github-releases depName=microsoft/vscode
-ARG VSCODE_VERSION=1.142.0
+ARG VSCODE_VERSION=1.144.0
 ARG DEV_HOME=/var/home/dev
 RUN --mount=type=bind,from=devtools,source=/,target=/run/devtools \
     set -eux; for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done; dnf -y install jq unzip; cd /tmp; \
