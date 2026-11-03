@@ -61,7 +61,7 @@ go-containerregistry v0.22.1 https://github.com/google/go-containerregistry/rele
 # renovate: datasource=github-releases depName=aquasecurity/trivy
 trivy v0.76.1 https://github.com/aquasecurity/trivy/releases/download/{v}/trivy_{n}_Linux-64bit.tar.gz https://github.com/aquasecurity/trivy/releases/download/{v}/trivy_{n}_checksums.txt trivy LICENSE,https://raw.githubusercontent.com/aquasecurity/trivy/{v}/NOTICE#sha256:aed9bc6dab87c6f6567d20bf0f5c0433a8ccd3ad7873322cf79b9244eb720a1f https://github.com/aquasecurity/trivy/archive/refs/tags/{v}.tar.gz
 # renovate: datasource=github-releases depName=pete911/certinfo
-certinfo v1.0.40 https://github.com/pete911/certinfo/releases/download/{v}/certinfo_{n}_linux_amd64.tar.gz https://github.com/pete911/certinfo/releases/download/{v}/checksums.txt certinfo LICENSE
+certinfo v1.0.41 https://github.com/pete911/certinfo/releases/download/{v}/certinfo_{n}_linux_amd64.tar.gz https://github.com/pete911/certinfo/releases/download/{v}/checksums.txt certinfo LICENSE
 # renovate: datasource=github-releases depName=getsops/sops
 sops v3.13.3 https://github.com/getsops/sops/releases/download/{v}/sops-{v}.linux.amd64 https://github.com/getsops/sops/releases/download/{v}/sops-{v}.checksums.txt sops-{v}.linux.amd64:sops https://raw.githubusercontent.com/getsops/sops/{v}/LICENSE#sha256:1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5 https://github.com/getsops/sops/archive/refs/tags/{v}.tar.gz
 # Signs and verifies the images (fedora-bootc's just cosign-keygen and just
@@ -123,7 +123,7 @@ fish 4.9.3 https://github.com/fish-shell/fish-shell/releases/download/{v}/fish-{
 # makes the Go and Deno here its own installs. The key is jdx's
 # (https://mise.jdx.dev/installing-mise.html).
 # renovate: datasource=github-releases depName=jdx/mise
-mise v2026.10.24 https://github.com/jdx/mise/releases/download/{v}/mise-{v}-linux-x64-musl.tar.gz https://github.com/jdx/mise/releases/download/{v}/SHASUMS256.txt,minisign:RWTC3g8W3z4RZK3V3qv7fa1QY4JEWyBtqIHW+85QlJpZc5yG+uNYNBSZ mise/bin/mise,mise/share/fish/vendor_conf.d/mise-activate.fish:share/fish/vendor_conf.d/mise-activate.fish mise/LICENSE https://github.com/jdx/mise/archive/refs/tags/{v}.tar.gz
+mise v2026.10.25 https://github.com/jdx/mise/releases/download/{v}/mise-{v}-linux-x64-musl.tar.gz https://github.com/jdx/mise/releases/download/{v}/SHASUMS256.txt,minisign:RWTC3g8W3z4RZK3V3qv7fa1QY4JEWyBtqIHW+85QlJpZc5yG+uNYNBSZ mise/bin/mise,mise/share/fish/vendor_conf.d/mise-activate.fish:share/fish/vendor_conf.d/mise-activate.fish mise/LICENSE https://github.com/jdx/mise/archive/refs/tags/{v}.tar.gz
 # renovate: datasource=github-releases depName=BurntSushi/ripgrep
 ripgrep 15.2.0 https://github.com/BurntSushi/ripgrep/releases/download/{v}/ripgrep-{v}-x86_64-unknown-linux-musl.tar.gz .sha256 ripgrep-{v}-x86_64-unknown-linux-musl/rg ripgrep-{v}-x86_64-unknown-linux-musl/COPYING,ripgrep-{v}-x86_64-unknown-linux-musl/LICENSE-MIT,ripgrep-{v}-x86_64-unknown-linux-musl/UNLICENSE
 # renovate: datasource=github-release-attachments depName=sharkdp/fd
