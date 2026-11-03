@@ -175,7 +175,7 @@ FROM sdk AS claude
 # dist-tag); the dev container's pin (devcontainer/Containerfile) moves with
 # it.
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.309
+ARG CLAUDE_VERSION=2.1.311
 RUN --mount=type=bind,from=claude-code,source=/,target=/run/claude-code \
     set -eux; \
     pin=$(/run/claude-code/tools/claude-code.sh --zst "$CLAUDE_VERSION"); \
