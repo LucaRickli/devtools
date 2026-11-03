@@ -35,7 +35,7 @@ FROM runtime AS build
 # signed as well, cannot stand in. The icons are the tarball's, as Mozilla's
 # Flatpak has them.
 # renovate: datasource=custom.firefox depName=firefox
-ARG FIREFOX_VERSION=159.0
+ARG FIREFOX_VERSION=159.0.1
 RUN set -eux; \
     for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done; \
     dnf -y --setopt=install_weak_deps=False install gnupg2 xz desktop-file-utils; \
