@@ -214,7 +214,7 @@ RUN install -d -m 700 -o dev -g dev /var/home/dev/.claude
 # Anthropic's signed manifest (tools/claude-code.sh). Its updates are off for
 # every copy, also the one the VS Code extension brings.
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.309
+ARG CLAUDE_VERSION=2.1.311
 RUN --mount=type=bind,from=claude-code,source=/,target=/run/claude-code \
     pin=$(/run/claude-code/tools/claude-code.sh "$CLAUDE_VERSION") \
     && mkdir -p /usr/local/share/claude-code \
