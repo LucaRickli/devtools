@@ -30,7 +30,7 @@ FROM runtime AS build
 # release. Unpacked as upstream's Flatpak installs it: all of it, but for
 # its top directory (deckcraft-<version>-linux-x86_64).
 # renovate: datasource=github-releases depName=storytold/deckcraft extractVersion=^v(?<version>.+)$
-ARG DECKCRAFT_VERSION=0.13.1
+ARG DECKCRAFT_VERSION=0.14.1
 RUN set -eux; \
     for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done; \
     dnf -y --setopt=install_weak_deps=False install desktop-file-utils; \
