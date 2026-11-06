@@ -109,7 +109,7 @@ protoc-gen-go-grpc v1.6.2 go:google.golang.org/grpc/cmd/protoc-gen-go-grpc - pro
 deno v2.9.8 https://github.com/denoland/deno/releases/download/{v}/deno-x86_64-unknown-linux-gnu.zip .sha256sum deno https://raw.githubusercontent.com/denoland/deno/{v}/LICENSE.md#sha256:f62497fffecc0852960c8d3e6934b9db86d16396e9b604072e923892cae3a588 https://github.com/denoland/deno/archive/refs/tags/{v}.tar.gz
 # rustup-init, then the toolchain through it.
 # renovate: datasource=github-tags depName=rust-lang/rustup
-rustup 1.29.2 https://static.rust-lang.org/rustup/archive/{v}/x86_64-unknown-linux-gnu/rustup-init .sha256 rustup-init https://raw.githubusercontent.com/rust-lang/rustup/{v}/LICENSE-APACHE#sha256:8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90,https://raw.githubusercontent.com/rust-lang/rustup/{v}/LICENSE-MIT#sha256:c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5
+rustup 1.29.3 https://static.rust-lang.org/rustup/archive/{v}/x86_64-unknown-linux-gnu/rustup-init .sha256 rustup-init https://raw.githubusercontent.com/rust-lang/rustup/{v}/LICENSE-APACHE#sha256:8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90,https://raw.githubusercontent.com/rust-lang/rustup/{v}/LICENSE-MIT#sha256:c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5
 # renovate: datasource=github-releases depName=rust-lang/rust
 rust 1.99.1 rustup - clippy,rustfmt,rust-src,rust-analyzer share/doc/rust/COPYRIGHT.html,share/doc/rust/licenses/ https://static.rust-lang.org/dist/rustc-{v}-src.tar.xz
 
@@ -123,7 +123,7 @@ fish 4.9.3 https://github.com/fish-shell/fish-shell/releases/download/{v}/fish-{
 # makes the Go and Deno here its own installs. The key is jdx's
 # (https://mise.jdx.dev/installing-mise.html).
 # renovate: datasource=github-releases depName=jdx/mise
-mise v2026.10.25 https://github.com/jdx/mise/releases/download/{v}/mise-{v}-linux-x64-musl.tar.gz https://github.com/jdx/mise/releases/download/{v}/SHASUMS256.txt,minisign:RWTC3g8W3z4RZK3V3qv7fa1QY4JEWyBtqIHW+85QlJpZc5yG+uNYNBSZ mise/bin/mise,mise/share/fish/vendor_conf.d/mise-activate.fish:share/fish/vendor_conf.d/mise-activate.fish mise/LICENSE https://github.com/jdx/mise/archive/refs/tags/{v}.tar.gz
+mise v2026.11.0 https://github.com/jdx/mise/releases/download/{v}/mise-{v}-linux-x64-musl.tar.gz https://github.com/jdx/mise/releases/download/{v}/SHASUMS256.txt,minisign:RWTC3g8W3z4RZK3V3qv7fa1QY4JEWyBtqIHW+85QlJpZc5yG+uNYNBSZ mise/bin/mise,mise/share/fish/vendor_conf.d/mise-activate.fish:share/fish/vendor_conf.d/mise-activate.fish mise/LICENSE https://github.com/jdx/mise/archive/refs/tags/{v}.tar.gz
 # renovate: datasource=github-releases depName=BurntSushi/ripgrep
 ripgrep 15.2.0 https://github.com/BurntSushi/ripgrep/releases/download/{v}/ripgrep-{v}-x86_64-unknown-linux-musl.tar.gz .sha256 ripgrep-{v}-x86_64-unknown-linux-musl/rg ripgrep-{v}-x86_64-unknown-linux-musl/COPYING,ripgrep-{v}-x86_64-unknown-linux-musl/LICENSE-MIT,ripgrep-{v}-x86_64-unknown-linux-musl/UNLICENSE
 # renovate: datasource=github-release-attachments depName=sharkdp/fd
