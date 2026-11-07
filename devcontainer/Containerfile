@@ -41,7 +41,7 @@ COPY --from=tools mise-system.sh mise-config.toml tools.txt /
 # Those in extensions.txt. Only the resulting extensions directory is copied
 # into the image. It does not depend on the server version: any client VS Code
 # that satisfies the extensions' `engines` uses them.
-FROM registry.fedoraproject.org/fedora-toolbox:44 AS vscode-extensions
+FROM registry.fedoraproject.org/fedora-toolbox:45 AS vscode-extensions
 # renovate: datasource=github-releases depName=microsoft/vscode
 ARG VSCODE_VERSION=1.145.0
 ARG DEV_HOME=/var/home/dev
@@ -63,7 +63,7 @@ RUN --mount=type=bind,from=devtools,source=/,target=/run/devtools \
     done
 
 # --- plain: the image, ghcr.io/lucarickli/devcontainer:latest ---------------
-FROM registry.fedoraproject.org/fedora-toolbox:44 AS plain
+FROM registry.fedoraproject.org/fedora-toolbox:45 AS plain
 
 # Fixed, not tunable: the COPY, the label and the ai stage below use them
 # literally.

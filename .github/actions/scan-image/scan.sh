@@ -79,7 +79,7 @@ podman image exists "$image" || { echo "no local image $image" >&2; exit 1; }
 # directory, which holds only this script's own files.
 test -s "$here/trivy-secret.yaml" || { echo "missing $here/trivy-secret.yaml" >&2; exit 1; }
 # Renovate's Fedora PR moves this release with the others.
-scanner=registry.fedoraproject.org/fedora-minimal:44
+scanner=registry.fedoraproject.org/fedora-minimal:45
 # Every run of trivy shares this cache, which holds its database.
 mkdir -p "$work/cache"
 # in_scanner runs trivy in a container of the scanner's image. Only the

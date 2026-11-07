@@ -78,7 +78,7 @@ COPY --from=build /app /app
 # branch is Fedora's release (runtime/Containerfile); the command, the app
 # (wordcraft-cli is beside it: flatpak run --command=wordcraft-cli).
 LABEL flatpak.id=ai.storyteller.wordcraft \
-      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.runtime=io.github.lucarickli.Platform//45 \
       flatpak.command=wordcraft
 
 # The permissions of upstream's Flatpak, the finish-args of its manifests

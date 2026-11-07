@@ -78,7 +78,7 @@ COPY --from=build /app /app
 # branch is Fedora's release (runtime/Containerfile); the command, the app
 # (gridcraft-cli is beside it: flatpak run --command=gridcraft-cli).
 LABEL flatpak.id=ai.storyteller.gridcraft \
-      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.runtime=io.github.lucarickli.Platform//45 \
       flatpak.command=gridcraft
 
 # The permissions of upstream's Flatpak, the finish-args of its manifests

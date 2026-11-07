@@ -74,7 +74,7 @@ COPY --from=build /app /app
 # branch is Fedora's release (runtime/Containerfile); the command, the app
 # (deckcraft-cli is beside it: flatpak run --command=deckcraft-cli).
 LABEL flatpak.id=ai.storyteller.deckcraft \
-      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.runtime=io.github.lucarickli.Platform//45 \
       flatpak.command=deckcraft
 
 # The permissions of upstream's Flatpak, the finish-args of its manifests

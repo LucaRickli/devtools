@@ -5,7 +5,7 @@
 # jq and tar, which read an image's archive and its files, util-linux for
 # setpriv and setsid, and an ordinary user for the test, tester. Never
 # published. Build context: this directory.
-FROM registry.fedoraproject.org/fedora:44
+FROM registry.fedoraproject.org/fedora:45
 RUN for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep 30; done \
     && dnf -y install --setopt=install_weak_deps=False flatpak dbus-daemon jq tar util-linux \
     && dnf clean all && rm -rf /var/cache/dnf /var/cache/libdnf5 \

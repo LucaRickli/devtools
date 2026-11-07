@@ -202,7 +202,7 @@ COPY --from=build /app /app
 # The branch is flatpak.branch's default, stable, which the machines'
 # remotes name.
 LABEL flatpak.id=io.github.lucarickli.Code \
-      flatpak.runtime=io.github.lucarickli.Sdk//44 \
+      flatpak.runtime=io.github.lucarickli.Sdk//45 \
       flatpak.command=code
 
 # The permissions: a sandbox, with host access an opt-in
