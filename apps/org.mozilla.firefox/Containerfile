@@ -92,7 +92,7 @@ COPY --from=build /app /app
 # release (runtime/Containerfile); the command, the launcher
 # (files/bin/firefox).
 LABEL flatpak.id=org.mozilla.firefox \
-      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.runtime=io.github.lucarickli.Platform//45 \
       flatpak.command=firefox
 
 # The permissions, one group for each reason. Flathub's, which Mozilla sets

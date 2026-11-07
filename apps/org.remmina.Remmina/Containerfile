@@ -127,7 +127,7 @@ COPY --from=build /app /app
 # runtime it runs on, whose branch is Fedora's release
 # (runtime/Containerfile); the command, Remmina.
 LABEL flatpak.id=org.remmina.Remmina \
-      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.runtime=io.github.lucarickli.Platform//45 \
       flatpak.command=remmina
 
 # The permissions, one group for each reason: Flathub's (the finish-args of

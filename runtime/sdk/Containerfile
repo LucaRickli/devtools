@@ -1,4 +1,4 @@
-# io.github.lucarickli.Sdk//44: the runtime (runtime/Containerfile) with a
+# io.github.lucarickli.Sdk//45: the runtime (runtime/Containerfile) with a
 # development environment on top, the runtime of the VS Code Flatpak
 # (apps/io.github.lucarickli.Code), whose terminal is one: the C and C++
 # toolchain with CMake, Ninja, Meson and the autotools, gdb and strace, git
@@ -74,7 +74,7 @@ RUN for i in 1 2 3; do dnf -q makecache && break; [ "$i" != 3 ] || exit 1; sleep
 # The SDK's ID; its branch, the runtime's (the Fedora release). The rest,
 # the environment and the GL extension point, is the runtime's labels.
 LABEL flatpak.id=io.github.lucarickli.Sdk \
-      flatpak.branch=44
+      flatpak.branch=45
 
 # --- the test: an app of its own on the SDK, FROM scratch so that none of
 # the labels above apply to it, whose command is test.sh. flatpak.sh test
@@ -82,7 +82,7 @@ LABEL flatpak.id=io.github.lucarickli.Sdk \
 FROM scratch AS test
 COPY --chmod=0755 test.sh /app/bin/sdk-test
 LABEL flatpak.id=io.github.lucarickli.Sdk.Test \
-      flatpak.runtime=io.github.lucarickli.Sdk//44 \
+      flatpak.runtime=io.github.lucarickli.Sdk//45 \
       flatpak.command=sdk-test
 
 # ptrace, for gdb and strace, as the VS Code app has it: flatpak's seccomp

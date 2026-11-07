@@ -1,4 +1,4 @@
-# io.github.lucarickli.Platform//44: the runtime the apps in apps/ with a
+# io.github.lucarickli.Platform//45: the runtime the apps in apps/ with a
 # Containerfile run on, Fedora's own packages for what GUI apps need (GTK 3
 # and 4, fonts, Mesa, the audio and D-Bus clients, Python) and for what its
 # apps link or run that Fedora has (Remmina's RDP, VNC and SPICE, the Craft
@@ -21,7 +21,7 @@
 # and the flatpak.runtime of the test stage and of each app move together, in
 # Renovate's Fedora PR, twice a year (the test fails while the first two
 # differ); Fedora's updates come with every build.
-FROM registry.fedoraproject.org/fedora:44 AS flatpak
+FROM registry.fedoraproject.org/fedora:45 AS flatpak
 
 # Fedora's updates first: the base image is days old, and dnf leaves a
 # package it finds installed at that version. English only: the base
@@ -139,7 +139,7 @@ RUN ln -s flatpak-xdg-open /usr/bin/xdg-open \
 # The runtime's ID, and its branch, the image's Fedora release (the FROM
 # above).
 LABEL flatpak.id=io.github.lucarickli.Platform \
-      flatpak.branch=44
+      flatpak.branch=45
 
 # The environment Flathub's runtimes set (org.freedesktop.Platform's
 # metadata), for what an app puts in /app, which here comes from Fedora
@@ -193,5 +193,5 @@ LABEL flatpak.finish-args.gl="\
 FROM scratch AS test
 COPY --chmod=0755 test.sh /app/bin/platform-test
 LABEL flatpak.id=io.github.lucarickli.Platform.Test \
-      flatpak.runtime=io.github.lucarickli.Platform//44 \
+      flatpak.runtime=io.github.lucarickli.Platform//45 \
       flatpak.command=platform-test
