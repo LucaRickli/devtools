@@ -127,7 +127,7 @@ mise v2026.11.0 https://github.com/jdx/mise/releases/download/{v}/mise-{v}-linux
 # renovate: datasource=github-releases depName=BurntSushi/ripgrep
 ripgrep 15.2.0 https://github.com/BurntSushi/ripgrep/releases/download/{v}/ripgrep-{v}-x86_64-unknown-linux-musl.tar.gz .sha256 ripgrep-{v}-x86_64-unknown-linux-musl/rg ripgrep-{v}-x86_64-unknown-linux-musl/COPYING,ripgrep-{v}-x86_64-unknown-linux-musl/LICENSE-MIT,ripgrep-{v}-x86_64-unknown-linux-musl/UNLICENSE
 # renovate: datasource=github-release-attachments depName=sharkdp/fd
-fd v10.5.0 https://github.com/sharkdp/fd/releases/download/{v}/fd-{v}-x86_64-unknown-linux-musl.tar.gz sha256:761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7 fd-{v}-x86_64-unknown-linux-musl/fd fd-{v}-x86_64-unknown-linux-musl/LICENSE-APACHE,fd-{v}-x86_64-unknown-linux-musl/LICENSE-MIT
+fd v10.5.1 https://github.com/sharkdp/fd/releases/download/{v}/fd-{v}-x86_64-unknown-linux-musl.tar.gz sha256:f6c95edb190c241df6fddc815a5bab4051444993ac5d92ddc6eec0e0dc2342c7 fd-{v}-x86_64-unknown-linux-musl/fd fd-{v}-x86_64-unknown-linux-musl/LICENSE-APACHE,fd-{v}-x86_64-unknown-linux-musl/LICENSE-MIT
 # renovate: datasource=github-releases depName=casey/just
 just 1.59.0 https://github.com/casey/just/releases/download/{v}/just-{v}-x86_64-unknown-linux-musl.tar.gz https://github.com/casey/just/releases/download/{v}/SHA256SUMS just LICENSE https://github.com/casey/just/archive/refs/tags/{v}.tar.gz
 # renovate: datasource=github-releases depName=cli/cli
